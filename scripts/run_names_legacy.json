@@ -1,0 +1,190 @@
+{
+  "_comment": [
+    "Legacy run-directory names -> names conforming to the rule in scripts/run_names.py.",
+    "`stamp_source` records where the timestamp came from, because for a directory that",
+    "predates the rule the launch time has to be recovered from evidence. Anything whose",
+    "stamp could not be recovered from a log or a checkpoint carries the mtime fallback.",
+    "`deferred` entries are blocked, not rejected: see the reason on each group."
+  ],
+  "renames": {
+    "math_opsd_slime": {
+      "new": "math-qwen3-1p7b-opsd-20260924_015038",
+      "stamp_source": "earliest iter_* mtime"
+    },
+    "grpo_standard_bshd": {
+      "new": "math-qwen3-1p7b-grpo-20260921_224239",
+      "stamp_source": "logs/grpo_run.log first timestamp"
+    },
+    "reward_cv_bshd": {
+      "new": "math-qwen3-1p7b-rewardcv-20260916_074012",
+      "stamp_source": "logs/reward_cv100_run.log first timestamp"
+    },
+    "reward_cv_calibrated_bshd": {
+      "new": "math-qwen3-1p7b-rewardcv-cal-20260917_135006",
+      "stamp_source": "logs/cvcalib100_run.log first timestamp"
+    },
+    "reward_cv_fixedgrader_bshd": {
+      "new": "math-qwen3-1p7b-rewardcv-fixedgrader-20260918_143929",
+      "stamp_source": "logs/reward_cv_fg100_run.log first timestamp"
+    },
+    "reward_cv_hpi_bshd": {
+      "new": "math-qwen3-1p7b-rewardcv-hpi-20260919_201825",
+      "stamp_source": "logs/hpi100_run.log first timestamp"
+    },
+    "reward_cv_hpi_v2_bshd": {
+      "new": "math-qwen3-1p7b-rewardcv-hpi-v2-20260920_174246",
+      "stamp_source": "logs/hpiv2_100_run.log first timestamp"
+    },
+    "reward_cv_hpi_v2_wedged_20260920": {
+      "new": "math-qwen3-1p7b-rewardcv-hpi-v2-wedged-20260920_183715",
+      "stamp_source": "earliest iter_* mtime"
+    },
+    "reward_cv_hpi_v15_bshd": {
+      "new": "math-qwen3-1p7b-rewardcv-hpi-v15-20260922_123443",
+      "stamp_source": "logs/hpiv15_100_run.log first timestamp"
+    },
+    "reward_cv_vnext_bshd": {
+      "new": "math-qwen3-1p7b-rewardcv-vnext-20260923_130456",
+      "stamp_source": "logs/cvvnext_100_run.log first timestamp"
+    },
+    "reward_cv_vnext_clean_bshd": {
+      "new": "math-qwen3-1p7b-rewardcv-vnext-clean-sidecar-20260924_024328",
+      "stamp_source": "logs/cvvnext_clean_100_run.log first timestamp"
+    },
+    "reward_only_vnext_bshd": {
+      "new": "math-qwen3-1p7b-rewardonly-vnext-20260923_184341",
+      "stamp_source": "logs/cvonly_100_run.log first timestamp"
+    },
+    "reward_only_vnext_clean_bshd": {
+      "new": "math-qwen3-1p7b-rewardonly-vnext-clean-sidecar-20260924_042749",
+      "stamp_source": "logs/cvonly_clean_100_run.log first timestamp"
+    },
+    "qwen3-4b-grpo": {
+      "new": "math-qwen3-4b-grpo-20260924_181826",
+      "stamp_source": "earliest iter_* mtime (no log in this tree; B-campaign logs stayed on Server B)"
+    },
+    "qwen3-4b-math-opsd-v2": {
+      "new": "math-qwen3-4b-rewardcv-vnext-v2-20260925_172346",
+      "stamp_source": "earliest iter_* mtime"
+    },
+    "qwen3-4b-math-opsd-gate1024": {
+      "new": "math-qwen3-4b-rewardcv-vnext-gate1024-20260924_034006",
+      "stamp_source": "earliest iter_* mtime"
+    },
+    "qwen3-4b-math-opsd-smokegate": {
+      "new": "math-qwen3-4b-rewardcv-vnext-smoke10-20260924_031222",
+      "stamp_source": "earliest iter_* mtime"
+    },
+    "qwen3-4b-reward-only": {
+      "new": "math-qwen3-4b-rewardonly-vnext-20260926_130015",
+      "stamp_source": "earliest iter_* mtime"
+    },
+    "qwen3-8b-math-opsd": {
+      "new": "math-qwen3-8b-rewardcv-vnext-20260930_144822",
+      "stamp_source": "logs/qwen3-8b_run.log first timestamp"
+    },
+    "qwen3-8b-math-opsd-gate1024": {
+      "new": "math-qwen3-8b-rewardcv-vnext-gate1024-20260930_134249",
+      "stamp_source": "logs/qwen3-8b_gate1024.log first timestamp"
+    },
+    "init_megatron_qwen3_1p7b": {
+      "new": "_init_megatron_qwen3-1p7b",
+      "stamp_source": "n/a: infrastructure, not a run"
+    },
+    "lora_save_repro": {
+      "new": "_lora_save_repro",
+      "stamp_source": "n/a: infrastructure, not a run"
+    },
+    "lora_sync": {
+      "new": "_lora_sync",
+      "stamp_source": "n/a: infrastructure, not a run"
+    },
+    "null_control": {
+      "new": "_null_control",
+      "stamp_source": "n/a: infrastructure, not a run"
+    },
+    "null_prefixes": {
+      "new": "_null_prefixes",
+      "stamp_source": "n/a: infrastructure, not a run"
+    },
+    "optim_sidecar_verify": {
+      "new": "_optim_sidecar_verify",
+      "stamp_source": "n/a: infrastructure, not a run"
+    },
+    "grpo_standard_bshd_empty_pre_rewardfix": {
+      "new": "_residue-grpo-empty-pre-rewardfix",
+      "stamp_source": "n/a: empty residue, kept as evidence"
+    },
+    "qwen3-8b-grpo": {
+      "new": "_residue-qwen3-8b-grpo-20260930_142914",
+      "stamp_source": "n/a: empty residue of a launch killed before any checkpoint"
+    },
+    "qwen3-8b-grpo-r1": {
+      "new": "math-qwen3-8b-grpo-20260930_202656",
+      "stamp_source": "logs/qwen3-8b_arms_queue.log arm-2 start line (the queue's -r1 fallback name)"
+    }
+  },
+  "deferred": {
+    "_groups": {
+      "alfworld": "The whole alfworld family belongs to a campaign that is RUNNING ON ANOTHER POD right now (2026-09-30 21:19: runs/afw64b_grpo and runs/afw64b_hsi_eval_cp49 were still being written). This pod cannot tell which of those directories a live job still holds open, and renaming a directory under a running job corrupts it. Apply this group once that campaign reports done; the identities and start stamps were already resolved from logs and reports, so the work is only the --apply.",
+      "live_here": "Live on THIS pod at the time of the audit. Rename when it finishes (it is a normal conforming candidate then).",
+      "reserved": "Not runs. dev_eval/ and eval_staging/ are stores -- their CELLS follow the rule, the store does not -- and _* is tooling by convention. Renaming the two stores would touch ~50 call sites for no naming benefit."
+    },
+    "afw64b_grpo": "alfworld",
+    "afw64b_hsi": "alfworld",
+    "afw64b_hsi_eval_cp24": "alfworld",
+    "afw64b_hsi_eval_cp49": "alfworld",
+    "afw64_grpo": "alfworld",
+    "afw_capprobe_cp99_c2048": "alfworld",
+    "alfworld_eval_base": "alfworld",
+    "alfworld_eval_base_1p7b": "alfworld",
+    "alfworld_eval_grpo_cp25": "alfworld",
+    "alfworld_eval_grpo_cp49": "alfworld",
+    "alfworld_eval_hsi_cp24": "alfworld",
+    "alfworld_eval_hsi_cp25": "alfworld",
+    "alfworld_eval_hsi_cp49": "alfworld",
+    "alfworld_eval_hsi_cp74": "alfworld",
+    "alfworld_grpo_1p7b": "alfworld",
+    "alfworld_grpo_r1": "alfworld",
+    "alfworld_grpo_v5": "alfworld",
+    "alfworld_hpi_future_1p7b": "alfworld",
+    "alfworld_hpi_future_final": "alfworld",
+    "alfworld_hpi_future_v8": "alfworld",
+    "alfworld_hpi_nooff": "alfworld",
+    "alfworld_hsi_cp25": "alfworld",
+    "alfworld_v2_base_eval_4b": "alfworld",
+    "alfworld_v2_contrast": "alfworld",
+    "alfworld_v2_diag": "alfworld",
+    "alfworld_v2_diag2": "alfworld",
+    "alfworld_v2_diag3": "alfworld",
+    "alfworld_v2_frozen": "alfworld",
+    "alfworld_v2_grpo_1step": "alfworld",
+    "alfworld_v2_grpo_4b": "alfworld",
+    "alfworld_v2_grpo_4b_c1024": "alfworld",
+    "alfworld_v2_grpo_4b_c1024_eval": "alfworld",
+    "alfworld_v2_grpo_5step": "alfworld",
+    "alfworld_v2_grpo_cp25": "alfworld",
+    "alfworld_v2_hpi_1step": "alfworld",
+    "alfworld_v2_hpi_4b": "alfworld",
+    "alfworld_v2_hpi_4b_c1024": "alfworld",
+    "alfworld_v2_hpi_4b_c1024_oom_at_step9": "alfworld",
+    "alfworld_v2_hpi_5step": "alfworld",
+    "alfworld_v2_hpi_think_4b_c1024": "alfworld",
+    "alfworld_v2_hpi_think_4b_c1024_eval_cp24": "alfworld",
+    "alfworld_v2_hpi_think_4b_c1024_eval_cp49": "alfworld",
+    "alfworld_v2_hpi_think_4b_c1024_eval_cp74": "alfworld",
+    "alfworld_v2_hpi_think_4b_c1024_eval_cp99": "alfworld",
+    "alfworld_v2_hpi_think_4b_smoke": "alfworld",
+    "alfworld_v2_hsi_c1024_eval": "alfworld",
+    "alfworld_v2_ours_cp25": "alfworld",
+    "dev_eval": "reserved",
+    "eval_staging": "reserved",
+    "_evalsrc": "reserved",
+    "_mirror_afw64b_hsi_cp24": "reserved",
+    "_mirror_afw64b_hsi_cp49": "reserved",
+    "_mirror_alfworld_v2_hpi_think_4b_c1024_cp24": "reserved",
+    "_mirror_alfworld_v2_hpi_think_4b_c1024_cp49": "reserved",
+    "_mirror_alfworld_v2_hpi_think_4b_c1024_cp74": "reserved",
+    "_mirror_alfworld_v2_hpi_think_4b_c1024_cp99": "reserved"
+  }
+}

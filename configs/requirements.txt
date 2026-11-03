@@ -1,0 +1,97 @@
+# opsd-slime: independent Qwen3-1.7B math OPSD harness on Ascend 910B2 (8x64GB HBM)
+# Python 3.10, CANN 8.5.1, driver 25.5.1.
+#
+# Reproduces the reference slime NPU env (validated on 910B2 + CANN 8.5.1, see
+# cua/slime-geo3k-rl-npu/requirements.txt). CUDA-only wheels (nvidia-*, CUDA triton)
+# are deliberately NOT installed.
+#
+# Install:
+#   conda create -n slime-npu python=3.10 -y && conda activate slime-npu
+#   pip install -r configs/requirements.txt
+#   pip install -e frameworks/Megatron-LM      --no-deps
+#   pip install -e frameworks/Megatron-Bridge  --no-deps
+#   pip install -e frameworks/mbridge          --no-deps
+#   pip install -e frameworks/MindSpeed        --no-deps
+#   pip install -e frameworks/slime-ascend     --no-deps
+#   pip install -e frameworks/sglang/python    --no-deps   # MUST be last
+#
+# Why torch 2.1.0: torch-npu 2.1.0.post17 pins torch==2.1.0 (validated combo with
+# the vendored sglang fork; torch>=2.2 breaks its torch._custom_op usage).
+# Why transformers 4.51.3 (NOT the 4.57.6 of the reference list): transformers
+# >= 4.56 calls torch.utils._pytree.register_pytree_node, which only exists in
+# torch >= 2.4, and therefore cannot import under the pinned torch 2.1.0.
+# 4.51.3 is the newest torch-2.1-compatible line that ships Qwen3 model classes
+# (needed by the frozen HF teacher); Megatron-Bridge logs "skipping model family"
+# notices for newer architectures, which is expected and harmless.
+
+# --- Core NPU stack (from internal mirror; CANN runtime comes from host) ---
+torch==2.1.0
+torchvision==0.16.0
+torch-npu==2.1.0.post17
+numpy==1.26.0
+
+# --- HuggingFace stack ---
+transformers==4.51.3
+peft==0.20.0
+datasets==5.0.1
+pandas
+pyarrow
+huggingface_hub
+hf_transfer
+
+# --- Distributed / RL infra ---
+ray==2.54.0
+deepspeed==0.15.4
+
+# --- sglang runtime support (sglang itself is editable-installed from frameworks/) ---
+sglang-router==0.3.2
+fastapi
+uvicorn
+uvloop
+pyzmq>=25.1.2
+pydantic
+orjson
+msgspec
+psutil
+setproctitle
+partial_json_parser
+sentencepiece
+tiktoken
+einops
+interegular
+pybase64
+prometheus-client>=0.20.0
+python-multipart
+pillow
+requests
+
+# --- missing from the first freeze (rebuild of 2026-09-14 after the container
+# reset wiped the original env; each was hit at import/runtime time) ---
+triton-ascend==3.2.0   # import-compat shim; CUDA triton deliberately NOT installed
+pybind11               # imported by triton-ascend
+SQLAlchemy             # mindspeed runtime dep
+scipy                  # mindspeed runtime dep
+openai                 # sglang connector import chain
+pylatexenc             # slime rm_hub math_utils
+math_verify            # official OPSD grader (tasks.math.reward)
+frozendict             # compressed_tensors dep
+# torch>=2.3/2.4-only APIs referenced at module level by the sglang fork and
+# compressed_tensors are backported in compat/sitecustomize.py (uint16/32/64,
+# float8_*) -- DO NOT upgrade torch for them (torch-npu 2.1.0.post17 pins 2.1.0).
+compressed_tensors==0.10.0  # --no-deps! newer versions need torch>=2.2 APIs +
+                            # transformers>=4.53 masking_utils; 0.10.0 exposes
+                            # exactly the symbols the sglang fork imports
+# --- logging / utils ---
+wandb
+tensorboard
+loguru
+tqdm
+pyyaml
+packaging
+ipython          # imported by sglang.utils
+rich             # imported by Megatron-Bridge
+omegaconf
+hydra-core
+# NOTE: Megatron-Bridge also lists nvidia-resiliency-ext, but pip-installing it
+# drags in torch>=2.3 (it resolves to torch 2.14) and would break the NPU pin.
+# megatron.core only needs it for the (unused) resiliency plugin.

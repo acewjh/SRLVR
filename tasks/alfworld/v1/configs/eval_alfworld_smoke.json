@@ -1,0 +1,29 @@
+{
+  "eval": {
+    "defaults": {},
+    "datasets": [
+      {
+        "name": "smoke_valid_seen",
+        "path": "/workspace/cua/repos/opsd-slime/tasks/alfworld/v1/configs/data/smoke_valid_seen.jsonl",
+        "input_key": "prompt",
+        "metadata_key": "metadata",
+        "n_samples_per_eval_prompt": 1,
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "top_k": 20,
+        "max_response_len": 1024
+      },
+      {
+        "name": "smoke_valid_unseen",
+        "path": "/workspace/cua/repos/opsd-slime/tasks/alfworld/v1/configs/data/smoke_valid_unseen.jsonl",
+        "input_key": "prompt",
+        "metadata_key": "metadata",
+        "n_samples_per_eval_prompt": 1,
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "top_k": 20,
+        "max_response_len": 1024
+      }
+    ]
+  }
+}

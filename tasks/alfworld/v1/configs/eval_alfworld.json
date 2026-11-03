@@ -1,0 +1,29 @@
+{
+  "eval": {
+    "defaults": {},
+    "datasets": [
+      {
+        "name": "valid_seen",
+        "path": "tasks/alfworld/v1/configs/data/valid_seen.jsonl",
+        "input_key": "prompt",
+        "metadata_key": "metadata",
+        "n_samples_per_eval_prompt": 1,
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "top_k": 20,
+        "max_response_len": 4096
+      },
+      {
+        "name": "valid_unseen",
+        "path": "tasks/alfworld/v1/configs/data/valid_unseen.jsonl",
+        "input_key": "prompt",
+        "metadata_key": "metadata",
+        "n_samples_per_eval_prompt": 1,
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "top_k": 20,
+        "max_response_len": 4096
+      }
+    ]
+  }
+}

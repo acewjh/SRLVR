@@ -1,0 +1,490 @@
+#!/bin/bash
+# ============================================================
+# v2 shared launcher -- the two nodes run this with ARM=grpo|gspo|hpi_future.
+#
+# Matched by construction. The ONLY difference between the arms is ARM, which
+# selects exactly two things:
+#   grpo : ALFWORLD_V2_HPI=0, no postprocess hook, plain trajectory-mean GRPO loss
+#   gspo : identical to grpo except --advantage-estimator gspo, i.e. the SAME
+#          trajectory-mean reduction over a SEQUENCE-level surrogate
+#          (mean-KL ratio per row instead of per token). No HPI, no scorer.
+#   hpi  : ALFWORLD_V2_HPI=1, the Full/Control scorer, the HPI-weighted loss
+# Everything else -- model, frozen schedule, G, rollout batch, thinking, sampling,
+# history length, max turns, response cap, LoRA, optimizer, LR, checkpoints,
+# eps_clip -- is set once, here.
+#
+# `--advantage-estimator` is passed on EVERY arm (default grpo), because leaving
+# it off is what let the gspo arm run GRPO numbers under a GSPO label: the flag
+# only reaches the surrogate through the custom loss, so it has to be spelled out.
+#
+# Usage: ARM=<grpo|gspo|hpi_future> RUN_NAME=<name> bash .../run_alfworld_v2_<arm>.sh
+# ============================================================
+set -uo pipefail
+
+BASE=/workspace/cua
+PROJ=$BASE/repos/opsd-slime
+# Backbone geometry. The defaults are the validated Qwen3-1.7B numbers, so the
+# 1.7B arms are byte-for-byte unchanged. The 4B port is a pure override of these
+# five values + MODEL (see TRANSFER_4B_PROMPT.md §6) -- nothing about the METHOD
+# is allowed to differ between the two backbones.
+MODEL="${MODEL:-$BASE/checkpoints/Qwen3-1.7B}"
+NUM_LAYERS="${NUM_LAYERS:-28}"
+HIDDEN_SIZE="${HIDDEN_SIZE:-2048}"
+FFN_HIDDEN_SIZE="${FFN_HIDDEN_SIZE:-6144}"
+NUM_ATTENTION_HEADS="${NUM_ATTENTION_HEADS:-16}"
+NUM_QUERY_GROUPS="${NUM_QUERY_GROUPS:-8}"
+
+ARM="${ARM:?ARM must be set by the calling run_alfworld_v2_*.sh}"
+RUN_NAME="${RUN_NAME:-alfworld_v2_${ARM}}"
+
+# ---- matched knobs ------------------------------------------------------------
+G="${G:-8}"
+ROLLOUT_BS="${ROLLOUT_BS:-4}"        # tasks per step
+GLOB_BS=$(( ROLLOUT_BS * G ))        # per-turn rows are trimmed to this in convert
+MAX_TURNS="${MAX_TURNS:-50}"
+MAX_RESPONSE="${MAX_RESPONSE:-512}"
+HISTORY_LENGTH="${HISTORY_LENGTH:-8}"
+FUTURE_GAP="${FUTURE_GAP:-1}"
+NUM_ROLLOUT="${NUM_ROLLOUT:-25}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-25}"
+SEED="${SEED:-42}"
+TP="${TP:-1}"                        # single-node only; see the v1 notes on TP+LoRA
+# Surrogate. slime's own default is grpo, so the pre-existing arms are unchanged
+# by passing it explicitly; the `gspo` arm below overrides it. eps_clip is NOT
+# retuned per arm on purpose: the point of the arm is to isolate the estimator.
+ADVANTAGE_ESTIMATOR="${ADVANTAGE_ESTIMATOR:-grpo}"
+# Extra train.py flags an arm needs (empty for every legacy arm).
+EXTRA_ARGS=()
+# Which model provider builds the actor. Only the HSI arm overrides it (to publish
+# the theta_old handle the scorer needs); every other arm keeps the stock provider,
+# so the built model is identical across arms.
+#
+# NOTE the two variables. `ARM_PROVIDER_PATH` is what the ARM switch selects and
+# `MODEL_PROVIDER_PATH` is the operator override; the effective value is resolved
+# once, at TRAIN_ARGS time. Setting MODEL_PROVIDER_PATH to its own default up here
+# and then letting the arm re-default it with `${MODEL_PROVIDER_PATH:-...}` silently
+# keeps the DEFAULT -- measured: the HSI arm ran for a preflight with the stock
+# provider, which is exactly the hook the scorer needs to be absent.
+ARM_PROVIDER_PATH=""
+MODEL_PROVIDER_PATH_OVERRIDE="${MODEL_PROVIDER_PATH:-}"
+
+# Training-side sequence length. slime defaults this to 4096 when unset, but with
+# HISTORY_LENGTH=8 the prompt alone reaches p99.9 ~3.5k tokens, so prompt+response
+# runs to ~7.6k and rows of 5,008 tokens were already being trained outside the
+# configured window. 8192 covers the measured p99.9 with margin; the serving
+# context (--sglang-context-length 32768) is unchanged and still far wider.
+SEQ_LENGTH="${SEQ_LENGTH:-8192}"
+
+# The trajectory-balanced reducer. Without it every turn-row is weighted equally,
+# which is the bug that collapsed the previous runs; see
+# alfworld_hpi_v2/train_data.py::trajectory_weighting. Set it here rather than
+# relying on anyone remembering, and keep `legacy` reachable for reproducing
+# historical numbers.
+export OPSD_V2_LOSS_NORM="${OPSD_V2_LOSS_NORM:-traj}"
+
+SCHEDULE="${SCHEDULE:-$PROJ/alfworld_hpi_v2/configs/train_schedule_seed42.jsonl}"
+
+LR="${LR:-5e-6}"
+EVAL_ARGS=()
+
+# ---- arm switch ---------------------------------------------------------------
+case "$ARM" in
+  grpo)
+    export ALFWORLD_V2_HPI=0
+    LOSS_FN="alfworld_hpi_v2.loss.alfworld_v2_loss"
+    POSTPROCESS_ARGS=()
+    ;;
+  gspo)
+    # Same rollout, same rows, same reduction as `grpo`; the surrogate is the
+    # sequence-level one (alfworld_hpi_v2/loss.py:compute_ppo_kl -> slime's
+    # compute_gspo_kl). Everything that could differ is deliberately left at the
+    # grpo values, so arm-to-arm the estimator is the only variable.
+    export ALFWORLD_V2_HPI=0
+    LOSS_FN="alfworld_hpi_v2.loss.alfworld_v2_loss"
+    POSTPROCESS_ARGS=()
+    ADVANTAGE_ESTIMATOR="gspo"
+    ;;
+  hpi_future)
+    export ALFWORLD_V2_HPI=1
+    # SINGLE-ROLLOUT HSI. The advantage is anchored on 2R-1 and the hindsight term
+    # is added inside it, so there is no group to normalise against and G collapses
+    # to 1. That is also the sampling-efficiency claim: one environment rollout per
+    # task instead of G=8.
+    export ALFWORLD_V2_HSI=1
+    G=1
+    # GBS is the number of TURN-ROWS per optimizer step, and it is held at 32 for
+    # both arms: that is what makes the optimizer-step size comparable. Letting it
+    # follow ROLLOUT_BS*G would drop HSI to 4 rows, i.e. a quarter of one trajectory
+    # per step, which would also split trajectories across steps and corrupt the
+    # trajectory-level reduction.
+    GBS_OVERRIDE=32
+    LOSS_FN="alfworld_hpi_v2.loss.alfworld_v2_loss"
+    # The scorer runs AFTER convert and BEFORE the step, inside the training
+    # process, so the teacher never sees the loss (or its recompute).
+    POSTPROCESS_ARGS=( --rollout-data-postprocess-path alfworld_hpi_v2.scorer.postprocess )
+    ;;
+  hsi)
+    # HSI, the 2026-10-04 protocol (task book V2 sections 3/6/7/8/9).
+    #
+    # G=1: the advantage is a same-policy hindsight contrast, not a group statistic,
+    # so one rollout per task already carries signal. GBS is held at 32 (same as
+    # every arm) so the optimizer step size stays comparable.
+    #
+    # The scorer runs in the TRAINING process, after convert and before train(), so
+    # the model it forwards still holds theta_old; see alfworld_hpi_v2/hsi_v2.py.
+    export ALFWORLD_V2_HPI=1
+    export ALFWORLD_V2_HSI=1
+    export ALFWORLD_V2_HSI_V2=1
+    G=1
+    GBS_OVERRIDE=32
+    LOSS_FN="alfworld_hpi_v2.loss.alfworld_v2_loss"
+    POSTPROCESS_ARGS=( --rollout-data-postprocess-path alfworld_hpi_v2.hsi_v2.postprocess )
+    ARM_PROVIDER_PATH="alfworld_hpi_v2.hsi_provider.custom_model_provider"
+    # The PPO old log-prob is the sampler's OWN value at generation time, so there is
+    # no pre-train old-actor forward at all (slime skips it under this flag). That is
+    # the "no old actor replay" requirement AND a real per-step saving.
+    EXTRA_ARGS=( --use-rollout-logprobs )
+    ;;
+  hsi_candidate)
+    # RETIRED 2026-10-04: the frozen-theta0 Candidate-Centered estimator. Kept
+    # runnable so its historical numbers stay reproducible, but the live campaign
+    # uses the `hsi` arm above. Do not launch new work on this arm.
+    #
+    # Structurally: 1 rollout + 1 future-conditioned frozen-teacher forward + 1
+    # policy train step. No matched/control teacher, no old-actor replay, no
+    # full-vocab credit tensor.
+    export ALFWORLD_V2_HPI=1
+    export ALFWORLD_V2_HSI=1
+    export ALFWORLD_V2_HSI_CANDIDATE=1
+    G=1
+    GBS_OVERRIDE=32
+    LOSS_FN="alfworld_hpi_v2.loss.alfworld_v2_loss"
+    POSTPROCESS_ARGS=( --rollout-data-postprocess-path alfworld_hpi_v2.candidate_center.postprocess )
+    # The PPO old log-prob is the sampler's OWN value at generation time, so there is
+    # no pre-train old-actor forward at all (slime skips it under this flag). That is
+    # the "no old actor replay" requirement AND a real per-step saving.
+    EXTRA_ARGS=( --use-rollout-logprobs )
+    ;;
+  eval)
+    # Eval-only: --num-rollout 0 runs the eval loop and exits. Uses the SAME v2
+    # rollout so the prompts and the per-turn layout are identical to training.
+    export ALFWORLD_V2_HPI=0
+    LOSS_FN="alfworld_hpi_v2.loss.alfworld_v2_loss"
+    POSTPROCESS_ARGS=()
+    NUM_ROLLOUT=0
+    EVAL_ARGS=(
+      --eval-interval 1
+      --eval-config "${ALFWORLD_V2_EVAL_CONFIG:-$PROJ/alfworld_hpi/configs/eval_alfworld.json}"
+      --n-samples-per-eval-prompt "${N_SAMPLES_PER_EVAL_PROMPT:-1}"
+      --eval-max-response-len "$MAX_RESPONSE"
+    )
+    ;;
+  *) echo "[v2] FATAL: unknown ARM=$ARM" >&2; exit 2 ;;
+esac
+
+# Everything that depends on G must be derived HERE, after the arm switch -- the
+# switch is what sets G=1 for HSI. Computing it earlier silently used G=8, which
+# disabled the LR guard below and then aborted actor init.
+GLOB_BS="${GBS_OVERRIDE:-$(( ROLLOUT_BS * G ))}"
+
+# slime derives `train_iters = num_rollout * rollout_bs * G // GBS` and falls back
+# to `lr_decay_iters = train_iters` when --lr-decay-iters is absent. With HSI's G=1
+# that product can be 0 (1 rollout x 4 tasks x 1 // 32 == 0), and Megatron aborts on
+# `assert self.lr_decay_steps > 0` during actor init -- before any rollout runs.
+# With --lr-decay-style constant the value cannot affect the schedule.
+# ---- eval-only ----------------------------------------------------------------
+# Mirrors v1's `base_eval` arm: --num-rollout 0 makes slime run the eval datasets
+# and exit without a training step. Eval goes through the SAME rollout function,
+# model, LoRA provider and sampling knobs as the training arms, so a checkpoint is
+# scored by exactly the code that produced it.
+#
+# This block must stay ABOVE the LR-schedule guard: it is what sets NUM_ROLLOUT=0,
+# and that guard is the only thing standing between eval-only and the
+# `assert self.lr_decay_steps > 0` abort in Megatron actor init.
+EVAL_ONLY="${EVAL_ONLY:-0}"
+# Two entry points mean the same thing (run_alfworld_v2_eval.sh sets ARM=eval,
+# run_alfworld_v2_eval_4b.sh sets EVAL_ONLY=1). Funnel them here so both get the
+# same GPU split and the same LR-guard placement -- a split that differed per
+# entry point would silently make two eval numbers incomparable.
+[ "$ARM" = "eval" ] && EVAL_ONLY=1
+if [ "$EVAL_ONLY" = "1" ]; then
+  NUM_ROLLOUT=0
+  # No training step runs, so hand the engines as many cards as possible: 7
+  # rollout + 1 actor is the split the repo's own dev-eval launcher uses.
+  ROLLOUT_GPUS="${ROLLOUT_GPUS:-7}"
+  ACTOR_GPUS="${ACTOR_GPUS:-1}"
+  EVAL_ARGS=(
+    --eval-interval 1
+    --eval-config "${EVAL_CONFIG:-$PROJ/alfworld_hpi/configs/eval_alfworld.json}"
+    --n-samples-per-eval-prompt "${N_SAMPLES_PER_EVAL_PROMPT:-1}"
+    --eval-max-response-len "$MAX_RESPONSE"
+  )
+else
+  ROLLOUT_GPUS="${ROLLOUT_GPUS:-4}"
+  ACTOR_GPUS="${ACTOR_GPUS:-4}"
+fi
+
+TRAIN_ITERS=$(( NUM_ROLLOUT * ROLLOUT_BS * G / GLOB_BS ))
+LR_DECAY_ARGS=()
+if [ "$TRAIN_ITERS" -le 0 ]; then
+  LR_DECAY_ARGS=( --lr-decay-iters 1 )
+fi
+
+# ---- HSI credit: the frozen common baseline for this campaign ----------------
+# `full`: credit over the WHOLE generated turn (think + action). The historical
+#   `action` span was a workaround for the turn-level form, where a think-span
+#   score was dominated by a condition-independent magnitude shift; the
+#   trajectory-wide centring in the full-token form removes that.
+# `token`: per-token d_j with trajectory-wide weighted centre/scale, instead of
+#   one scalar per turn broadcast across its tokens.
+# Both nodes must agree on these; only Node1's credit CONSTRUCTION differs.
+export ALFWORLD_V2_HPI_SPAN="${ALFWORLD_V2_HPI_SPAN:-full}"
+export ALFWORLD_V2_HSI_GRANULARITY="${ALFWORLD_V2_HSI_GRANULARITY:-token}"
+
+export ALFWORLD_V2_MAX_TURNS="$MAX_TURNS"
+export ALFWORLD_V2_MAX_RESPONSE="$MAX_RESPONSE"
+export ALFWORLD_V2_HISTORY="$HISTORY_LENGTH"
+export ALFWORLD_V2_FUTURE_GAP="$FUTURE_GAP"
+export ALFWORLD_V2_SCHEDULE="$SCHEDULE"
+export ALFWORLD_ACTION_HISTORY="$HISTORY_LENGTH"
+export ALFWORLD_MAX_TURNS="$MAX_TURNS"
+
+# ---- Candidate-Centered HSI engine/sampler conventions -----------------------
+# The engine must report the SAMPLER's candidates and log-probs (no re-forward):
+#   * top_logprobs_num is set per request in episode._generate (= CANDIDATE_K).
+#   * SGLANG_RETURN_ORIGINAL_LOGPROB is deliberately LEFT AT ITS DEFAULT (False).
+#     That default makes the engine return `log_softmax(logits / rollout_temperature)`
+#     (sglang/srt/layers/sampler.py::_forward_ascend_backend), which is exactly the
+#     convention the TRAINER uses -- `megatron_utils/loss.py::get_responses` divides
+#     the logits by `args.rollout_temperature` before its log-softmax (loss.py:102
+#     and loss.py:128). With both sides in the same convention the PPO ratio is ~1
+#     on-policy, which is what makes `--use-rollout-logprobs` legitimate.
+#
+#     Setting SGLANG_RETURN_ORIGINAL_LOGPROB=1 breaks that: the engine then returns
+#     `log_softmax(logits)` and the ratio becomes exp(log pi_{T}(y) - log pi_{T=1}(y)),
+#     a SYSTEMATIC per-token bias rather than noise. Measured consequence of exactly
+#     that mistake on run ...153227: response length 800 -> 25 tokens, reward
+#     0.58 -> 0.0, action_valid 97% -> 44%, and the policy drifting onto
+#     `<boolean>false</boolean>`. Because it is a convention mismatch, the
+#     temperature compensation has to be removed WITH it: dividing pre-temperature
+#     values by T would double-apply it.
+#
+#     For the same reason ALFWORLD_V2_HSI_SAMPLER_TEMP stays unset (0 = "the engine
+#     already reports the sampling distribution"), so `sampling_probabilities`
+#     softmaxes the returned values directly and recovers the true p_t.
+if [ "$ARM" = "hsi_candidate" ]; then
+  unset SGLANG_RETURN_ORIGINAL_LOGPROB ALFWORLD_V2_HSI_SAMPLER_TEMP
+  export ALFWORLD_V2_HSI_CANDIDATE_K="${ALFWORLD_V2_HSI_CANDIDATE_K:-20}"
+  export ALFWORLD_V2_HSI_TOP_P="${ALFWORLD_V2_HSI_TOP_P:-0.95}"
+fi
+# ---- HSI (V2) sampler conventions --------------------------------------------
+# Task book section 6: the candidate set is the top-128 of the TEMPERATURE-1
+# FULL-SUPPORT policy, never a post-top-p nucleus. That is expressed by the two
+# exports below, not by code: `--rollout-top-k` is disabled and `--rollout-top-p`
+# is 1.0, so the engine's top-128 list is the head of the full softmax and
+# `candidate_center.sampling_probabilities` applies no truncation when it
+# renormalises the row into rho_t.
+#
+# At T = 1.0 the temperature convention stops being ambiguous: the engine's default
+# `log_softmax(logits / T)` and the `SGLANG_RETURN_ORIGINAL_LOGPROB=1` form
+# `log_softmax(logits)` are the SAME object, and `megatron_utils/loss.py` divides
+# the trainer logits by `rollout_temperature = 1.0`, i.e. not at all. The contract
+# the task book asks for -- generation-time old_logp equals the trainer's initial
+# current_logp on the same token -- therefore holds by construction at this
+# sampling temperature, and `loss.verify_old_policy_contract` asserts it at run
+# time on the first step rather than leaving it as an argument.
+if [ "$ARM" = "hsi" ]; then
+  unset SGLANG_RETURN_ORIGINAL_LOGPROB ALFWORLD_V2_HSI_SAMPLER_TEMP
+  export ALFWORLD_V2_HSI_CANDIDATE_K="${ALFWORLD_V2_HSI_CANDIDATE_K:-128}"
+  export ALFWORLD_V2_HSI_TOP_P="${ALFWORLD_V2_HSI_TOP_P:-1.0}"
+fi
+export ALFWORLD_OVERLAY_SITE="${ALFWORLD_OVERLAY_SITE:-$BASE/envs/alfworld_overlay/lib/python3.10/site-packages}"
+
+# ---- sampler flags ------------------------------------------------------------
+# DO NOT pass `--rollout-top-k` / `--rollout-top-p` / `--rollout-temperature`
+# explicitly for the V2 protocol. A NEGATIVE value as its own token (`--rollout-top-k
+# -1`) leaves an EMPTY-STRING key in slime's args namespace; MindSpeed's
+# `transformer_config_init_subclass` copies every unknown arg key into
+# `TransformerConfig.__annotations__`, dataclasses then renders a field literally
+# named "" and the generated `__init__` blows up with
+# `SyntaxError: invalid syntax` -- in `parse_args()`, before a single NPU is touched.
+# Measured twice on this stack (2026-09-23 and again 2026-10-04); see the campaign
+# notes. slime's own defaults are ALREADY the V2 values
+# (`slime/utils/arguments.py`: temperature 1.0, top_p 1.0, top_k -1), so the correct
+# way to ask for full-softmax sampling is to ask for NOTHING.
+#
+# The retired arms keep the 2026-10-03 sampler explicitly, so their historical
+# numbers stay reproducible from this file.
+SAMPLER_ARGS=()
+if [ "${ALFWORLD_V2_PROTOCOL:-0}" = "1" ]; then
+  # V2: rely on slime's defaults (T=1.0 / top_p=1.0 / top_k=-1). An operator may
+  # still override deliberately, but only with a POSITIVE/normal token.
+  [ -n "${ROLLOUT_TEMP:-}" ] && SAMPLER_ARGS+=( --rollout-temperature "$ROLLOUT_TEMP" )
+  [ -n "${ROLLOUT_TOP_P:-}" ] && SAMPLER_ARGS+=( --rollout-top-p "$ROLLOUT_TOP_P" )
+  [ -n "${ROLLOUT_TOP_K:-}" ] && SAMPLER_ARGS+=( --rollout-top-k "$ROLLOUT_TOP_K" )
+else
+  SAMPLER_ARGS+=(
+    --rollout-temperature "${ROLLOUT_TEMP:-0.6}"
+    --rollout-top-p "${ROLLOUT_TOP_P:-0.95}"
+    --rollout-top-k "${ROLLOUT_TOP_K:-20}"
+  )
+fi
+
+SAVE_DIR="${SAVE_DIR:-$PROJ/runs/$RUN_NAME}"
+LOG="${LOG:-$PROJ/logs/${RUN_NAME}.log}"
+LOCK="/tmp/opsd_${RUN_NAME}.lock"
+mkdir -p "$SAVE_DIR" "$(dirname "$LOG")"
+
+exec 8>"$LOCK"
+if ! flock -n 8; then echo "[v2] another $RUN_NAME holds $LOCK" >> "$LOG"; exit 1; fi
+
+RESUME_FROM="${RESUME_FROM:-}"
+RESUME_ARGS=()
+if [ -n "$RESUME_FROM" ]; then
+  [ -s "$RESUME_FROM/latest_checkpointed_iteration.txt" ] || { echo "[v2] FATAL: no ckpt in $RESUME_FROM" >> "$LOG"; exit 1; }
+  RESUME_ARGS=(--no-load-optim --no-load-rng)
+elif [ -e "$SAVE_DIR/latest_checkpointed_iteration.txt" ]; then
+  echo "[v2] FATAL: $SAVE_DIR already holds a run" >> "$LOG"; exit 1
+fi
+
+source /opt/conda/etc/profile.d/conda.sh
+conda activate cua-rl 2>/dev/null || conda activate slime-npu
+source /usr/local/Ascend/cann-8.5.1/set_env.sh
+
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export NODE_IFNAME="${NODE_IFNAME:-eth0}"
+export GLOO_SOCKET_IFNAME=$NODE_IFNAME TP_SOCKET_IFNAME=$NODE_IFNAME HCCL_SOCKET_IFNAME=$NODE_IFNAME
+export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+export PYTHONBUFFERED=16
+export PYTORCH_NPU_ALLOC_CONF="${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}"
+export PYTHONPATH="$PROJ/compat:$PROJ/frameworks/Megatron-LM:$PROJ/frameworks/Megatron-Bridge/src:$PROJ/frameworks/mbridge:$PROJ/frameworks/MindSpeed:$PROJ/frameworks/sglang/python:$PROJ/frameworks/slime-ascend:$PROJ:$PYTHONPATH"
+export WANDB_MODE=disabled WANDB_DISABLED=true
+
+export OPSD_LORA="${OPSD_LORA:-1}"
+export OPSD_LORA_R="${OPSD_LORA_R:-64}"
+export OPSD_LORA_ALPHA="${OPSD_LORA_ALPHA:-128}"
+export OPSD_LORA_DROPOUT="${OPSD_LORA_DROPOUT:-0.0}"
+
+# Tied vs untied embeddings is a per-backbone fact, not a knob: Qwen3-1.7B and
+# -4B tie (config.json tie_word_embeddings=true), Qwen3-8B does not. Getting it
+# wrong does not error -- it builds a different module tree than the checkpoint,
+# so the flag lives on the backbone card (_8b_backbone.sh sets it) rather than
+# being remembered here.
+UNTIE_ARGS=()
+[ "${UNTIE_EMBEDDINGS:-0}" = "1" ] && UNTIE_ARGS=( --untie-embeddings-and-output-weights )
+
+MODEL_ARGS=(
+   --swiglu --num-layers "$NUM_LAYERS" --hidden-size "$HIDDEN_SIZE" --ffn-hidden-size "$FFN_HIDDEN_SIZE"
+   --num-attention-heads "$NUM_ATTENTION_HEADS" --group-query-attention --num-query-groups "$NUM_QUERY_GROUPS"
+   --use-rotary-position-embeddings --disable-bias-linear --normalization "RMSNorm"
+   --norm-epsilon 1e-6 --rotary-base 1000000 --vocab-size 151936
+   --padded-vocab-size 151936 --kv-channels 128 --qk-layernorm
+   "${UNTIE_ARGS[@]+"${UNTIE_ARGS[@]}"}"
+)
+
+[ -s "$SCHEDULE" ] || { echo "[v2] FATAL: schedule missing at $SCHEDULE" >> "$LOG"; exit 3; }
+
+echo "[v2] arm=$ARM hpi=$ALFWORLD_V2_HPI estimator=$ADVANTAGE_ESTIMATOR G=$G bs=$ROLLOUT_BS GBS=$GLOB_BS turns=$MAX_TURNS cap=$MAX_RESPONSE hist=$HISTORY_LENGTH gap=$FUTURE_GAP steps=$NUM_ROLLOUT" | tee -a "$LOG"
+
+# The full train.py argument vector, as an array so it can be (a) executed and
+# (b) replayed through slime's own parser without touching an NPU -- see the
+# DRY_RUN_PARSE block below and alfworld_hpi_v2/scripts/argv_preflight.py.
+TRAIN_ARGS=(
+   "${MODEL_ARGS[@]}"
+   --hf-checkpoint "$MODEL"
+   --load "${EVAL_LOAD:-${EVAL_LOAD_FROM:-${RESUME_FROM:-$MODEL}}}"
+   --save "$SAVE_DIR"
+   --save-interval "$SAVE_INTERVAL"
+   "${RESUME_ARGS[@]}"
+   --prompt-data "$PROJ/alfworld_hpi/configs/data/train.jsonl"
+   --input-key prompt
+   --metadata-key metadata
+   --rollout-function-path alfworld_hpi_v2.rollout.generate_rollout
+   --custom-convert-samples-to-train-data-path alfworld_hpi_v2.train_data.convert_samples_to_train_data
+   "${POSTPROCESS_ARGS[@]}"
+   --rollout-batch-size "$ROLLOUT_BS"
+   --over-sampling-batch-size "$ROLLOUT_BS"
+   --n-samples-per-prompt "$G"
+   --rollout-max-response-len "$MAX_RESPONSE"
+   ${SAMPLER_ARGS[@]+"${SAMPLER_ARGS[@]}"}
+   --rollout-shuffle
+   --rollout-num-gpus "$ROLLOUT_GPUS"
+   --rollout-num-gpus-per-engine 1
+   --sglang-attention-backend ascend
+   --sglang-mem-fraction-static 0.82
+   --sglang-context-length 32768
+   --sglang-chunked-prefill-size 8192
+   --sglang-disable-radix-cache
+   --actor-num-nodes 1
+   --actor-num-gpus-per-node "$ACTOR_GPUS"
+   --num-gpus-per-node 8
+   --num-rollout "$NUM_ROLLOUT"
+   --transformer-impl local
+   --qkv-format bshd
+   --tensor-model-parallel-size "$TP"
+   --pipeline-model-parallel-size 1
+   --context-parallel-size 1
+   --expert-model-parallel-size 1
+   --global-batch-size "$GLOB_BS"
+   --micro-batch-size 1
+   --seq-length "$SEQ_LENGTH"
+   --calculate-per-token-loss
+   --loss-type custom_loss
+   --custom-loss-function-path "$LOSS_FN"
+   --advantage-estimator "$ADVANTAGE_ESTIMATOR"
+   --use-opsd
+   ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
+   --optimizer adam
+   --lr "${LR:-5e-6}"
+   --lr-decay-style constant
+   "${LR_DECAY_ARGS[@]}"
+   "${EVAL_ARGS[@]}"
+   --weight-decay 0.0
+   --adam-beta1 0.9
+   --adam-beta2 0.999
+   --clip-grad "${CLIP_GRAD:-1.0}"
+   --recompute-granularity full
+   --recompute-method block
+   --recompute-num-layers "${RECOMPUTE_NUM_LAYERS:-1}"
+   --attention-dropout 0.0
+   --hidden-dropout 0.0
+   --attention-softmax-in-fp32
+   --attention-backend flash
+   --use-flash-attn
+   --no-gradient-accumulation-fusion
+   --log-interval 1
+   --seed "$SEED"
+   "${EVAL_ARGS[@]}"
+   --save-debug-rollout-data "$SAVE_DIR/rollout_{rollout_id}.pt"
+   --custom-model-provider-path "${MODEL_PROVIDER_PATH_OVERRIDE:-${ARM_PROVIDER_PATH:-math_opsd.lora_megatron.custom_model_provider}}" \
+   --only-train-params-name-list '.*\.lora_.*'
+   --no-save-optim --no-save-rng
+)
+
+# Replay the argv through slime's parser and exit. This is the cheap gate for the
+# one failure mode that has cost this project real time twice: a flag that parses
+# into an EMPTY-STRING arg key (a bare negative value is the usual way in) crashes
+# dataclass codegen inside `parse_args()` with a SyntaxError, several minutes into
+# a launch, with a traceback that points at Megatron-Bridge rather than at the
+# offending flag. Costs seconds and no NPU.
+if [ "${DRY_RUN_PARSE:-0}" = "1" ]; then
+  python "$PROJ/alfworld_hpi_v2/scripts/argv_preflight.py" "${TRAIN_ARGS[@]}"
+  exit $?
+fi
+
+if ! ray status 2>/dev/null | grep -q "1 node"; then
+  ray stop --force 2>/dev/null || true
+  ray start --head --node-ip-address 127.0.0.1 --disable-usage-stats --dashboard-host 0.0.0.0 --dashboard-port 8265 2>&1 | tail -2
+fi
+cleanup_ray() { ray stop --force 2>/dev/null || true; }
+trap cleanup_ray EXIT
+
+cd "$PROJ"
+
+# `--use-opsd` makes slime hand the loss the rollout's own per-token advantages
+# verbatim, bypassing its positional group normalisation -- which is what keeps
+# the semantics "GRPO over episodes" now that the rows are turns.
+export OPSD_ENABLED=1
+
+python "$PROJ/frameworks/slime-ascend/train.py" "${TRAIN_ARGS[@]}" >> "$LOG" 2>&1
+echo "[v2] $ARM exited rc=$? $(date '+%F %H:%M:%S')" >> "$LOG"

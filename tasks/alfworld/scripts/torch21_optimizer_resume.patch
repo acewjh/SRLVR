@@ -1,0 +1,60 @@
+--- a/frameworks/Megatron-LM/megatron/core/optimizer/distrib_optimizer.py
++++ b/frameworks/Megatron-LM/megatron/core/optimizer/distrib_optimizer.py
+@@ -636,8 +636,11 @@
+         # Extract 'step', for non-Apex/TE support.
+         if not HAVE_APEX_OR_TE:
+             steps = list(set([s["step"].item() for s in inner_state_dict["state"].values()]))
+-            assert len(steps) == 1
+-            step = steps[0]
++            # A freshly constructed torch AdamW has no state until its first
++            # update. DCP requests this template BEFORE loading the saved state;
++            # its placeholder step is zero and will be overwritten on restore.
++            assert len(steps) <= 1
++            step = steps[0] if steps else 0
+         elif isinstance(self.optimizer, HybridDeviceOptimizer):
+             step = None
+             for optimizer in self.optimizer.sub_optimizers:
+@@ -819,11 +822,13 @@
+         if not HAVE_APEX_OR_TE:
+             steps = list(set([g["step"] for g in state_dict["optimizer"]["param_groups"]]))
+             assert len(steps) == 1
+-            step = torch.tensor(steps[0], dtype=torch.float)
++            step = torch.tensor(steps[0], dtype=torch.float, device="cpu")
+ 
+             for s in state_dict_state.values():
+                 # Native PyTorch state dict requires step (i.e., iteration).
+-                s["step"] = step
++                # Adam increments each parameter's counter in place. Sharing
++                # this scalar would advance every counter once per parameter.
++                s["step"] = step.detach().clone()
+         elif isinstance(self.optimizer, HybridDeviceOptimizer):
+             # Handle Torch AdamW special case, which, unlike FusedAdam, Torch AdamW
+             # has an extra optimizer state "step".
+@@ -930,6 +935,10 @@
+             optim_state = self.optimizer.state[main_param]
+             dst_tensors = {"param": main_param, **optim_state}
+             for key in dst_tensors:
++                # Torch Adam's scalar step is restored from the common param
++                # group state. Model-space shards deliberately omit that scalar.
++                if key == "step" and key not in tensors:
++                    continue
+                 dst_tensors[key].copy_(tensors[key])
+ 
+     def get_parameter_state_dp_reshardable(self):
+--- a/frameworks/MindSpeed/mindspeed/core/megatron_basic/megatron_basic.py
++++ b/frameworks/MindSpeed/mindspeed/core/megatron_basic/megatron_basic.py
+@@ -280,11 +280,12 @@
+         steps = list(set([g["step"] for g in state_dict["optimizer"]["param_groups"]]))
+         if len(steps) != 1:
+             raise AssertionError(f"Expect exactly one kind of step, but detect {len(steps)} kinds of steps")
+-        step = torch.tensor(steps[0], dtype=torch.float)
++        step = torch.tensor(steps[0], dtype=torch.float, device="cpu")
+ 
+         for s in state_dict_state.values():
+             # Native PyTorch state dict requires step (i.e., iteration).
+-            s["step"] = step
++            # Native Adam mutates each per-parameter counter in place.
++            s["step"] = step.detach().clone()
+     elif isinstance(self.optimizer, HybridDeviceOptimizer):
+         # Handle Torch AdamW special case, which, unlike FusedAdam, Torch AdamW
+         # has an extra optimizer state “step”.

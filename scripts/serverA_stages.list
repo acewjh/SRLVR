@@ -1,0 +1,14 @@
+# Server A stage order (user directive 2026-09-24): A1 -> A2 -> A3.
+# Appending here while the queue runs is safe; the queue re-reads this file
+# each pass and stops when a full pass changes nothing.
+a1_arm1
+a1_arm2
+a1_eval
+a2_grpo_cp75
+a3_opsd_unified
+# Added 2026-09-24 12:35: cvvnext_clean_cp100_aime25 died (SGLangEngine actor
+# SYSTEM_ERROR, rc=1, no dump). The eval queue warns-and-continues by design, so
+# without this explicit second pass that cell would never be measured. Appended
+# at EOF on purpose: the running queue reads this file sequentially and an insert
+# mid-file would shift its offset.
+a1_eval_retry

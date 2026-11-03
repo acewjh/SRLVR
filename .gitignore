@@ -1,0 +1,10 @@
+runs/
+logs/
+*.log
+reports/
+__pycache__/
+*.pyc
+*.so
+*.tar.gz
+.venv/
+checkpoints/

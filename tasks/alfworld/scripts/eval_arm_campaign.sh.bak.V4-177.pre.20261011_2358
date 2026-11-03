@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# ============================================================
+# Post-training evaluation driver for the 2026-10-03 two-node campaign.
+#
+#   Stage A  the frozen 64-game dev subset at cp10 / cp25 / cp50
+#   Stage B  full ALFWorld (valid_seen 140 + valid_unseen 134) at cp50, and at the
+#            dev-best checkpoint when that is not cp50 (task book section F)
+#
+# Why AFTER training rather than between rollouts: an eval needs all 8 NPUs and
+# `eval_alfworld_ckpt.sh` refuses to start while a trainer holds them, so scoring
+# between cycles would either stall for hours or steal cards from the run. The
+# checkpoints persist, so the same numbers come out afterwards. Section F's
+# "训练期间不做昂贵 full eval" is satisfied a fortiori.
+#
+# PROTOCOL IDENTITY (section F: "GRPO 与 HSI 使用完全相同的 eval protocol"): both
+# arms are scored through the SAME default eval path -- ARM=grpo, ALFWORLD_V2_HPI=0
+# (run_alfworld_v2_eval_4b.sh pins it), plain rollout, no postprocess hook. The
+# student prompt and the env reward do not depend on the training estimator, so
+# exporting the HSI switches here would change nothing except the risk of scoring
+# the two arms with two different module trees. This driver deliberately does not.
+#
+# Idempotent: EVAL_OK is written last and short-circuits a re-run; a crash mid-way
+# resumes at the first checkpoint with no eval run recorded. Running it twice is
+# safe. It never deletes anything and never touches another run's directory.
+#
+# Usage: bash eval_arm_campaign.sh <run-name> <method-slug> [iters...]
+# ============================================================
+set -uo pipefail
+
+R=/workspace/cua/repos/opsd-slime
+RUN="${1:?usage: eval_arm_campaign.sh <run-name> <method-slug> [iters...]}"
+METHOD_SLUG="${2:?usage: eval_arm_campaign.sh <run-name> <method-slug> [iters...]}"
+shift 2
+# ITER NUMBERS ARE 0-BASED ROLLOUT IDS, NOT CYCLE COUNTS.
+# slime saves when `(rollout_id + 1) % save_interval == 0`
+# (frameworks/slime-ascend/slime/utils/misc.py::should_run_periodic_action), and it
+# names the directory with `rollout_id`. With save_interval=5 and num_rollout=50 the
+# checkpoints therefore land on rollout_id 4, 9, 14, ..., 49 -- so the task book's
+# "cp10 / cp25 / cp50" (the 10th, 25th and 50th CYCLE) are iter_0000009 / 24 / 49.
+# Passing 10/25/50 would look for directories that are never written and the
+# pipeline would wait out MAX_WAIT_H and then evaluate nothing.
+ITERS=("$@")
+[ "${#ITERS[@]}" -gt 0 ] || ITERS=(9 24 49)
+LAST="${ITERS[${#ITERS[@]}-1]}"
+
+# Both arms are Qwen3-4B; the backbone card is the one the run was trained with.
+export MODEL_SLUG="${MODEL_SLUG:-qwen3-4b}"
+export BACKBONE="${BACKBONE:-4b}"
+# Held identical to training (task book section A).
+export MAX_RESPONSE="${MAX_RESPONSE:-4096}"
+export MAX_TURNS="${MAX_TURNS:-50}"
+export HISTORY_LENGTH="${HISTORY_LENGTH:-8}"
+export SEQ_LENGTH="${SEQ_LENGTH:-8192}"
+
+SRC="$R/runs/$RUN"
+OUT="$SRC/eval"
+DEV_CFG="$R/alfworld_hpi/configs/eval_alfworld_dev64.json"
+# Resolve the dev subset the eval config ACTUALLY reads, so the summary below can
+# never print the md5 of a different file than the one that was scored. The config
+# points at alfworld_hpi_v2/configs/data/dev64.jsonl, NOT the same-named file under
+# alfworld_hpi/ (the two hold different game sets -- see PROGRESS.md cycle 9).
+DEV_DATA_REL=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['eval']['datasets'][0]['path'])" "$DEV_CFG" 2>/dev/null)
+DEV_DATA="$R/${DEV_DATA_REL:-alfworld_hpi_v2/configs/data/dev64.jsonl}"
+FULL_CFG="$R/alfworld_hpi/configs/eval_alfworld.json"
+PIPE_LOG="$OUT/pipeline.log"
+SUMMARY="$OUT/EVAL_SUMMARY.md"
+DONE_MARK="$OUT/EVAL_OK"
+mkdir -p "$OUT"
+
+MAX_WAIT_H="${MAX_WAIT_H:-40}"
+
+log() { echo "[pipe] $(date '+%F %T') $*" | tee -a "$PIPE_LOG"; }
+
+if [ -f "$DONE_MARK" ]; then log "EVAL_OK present -- nothing to do"; exit 0; fi
+
+iter_dir() { printf '%s/iter_%07d' "$SRC" "$1"; }
+
+# A trainer on THIS node owns all 8 cards; wait it out rather than fight it. The
+# check is per-node, so Node0's driver waits on Node0's runs only.
+trainer_running() { pgrep -f '[s]lime-ascend/train.py' > /dev/null; }
+
+wait_for_training() {
+  local waited=0 cap=$(( MAX_WAIT_H * 60 ))
+  while :; do
+    if trainer_running; then
+      sleep 300; waited=$(( waited + 5 )); continue
+    fi
+    # No trainer: either the run finished, or a supervisor is between restarts.
+    # Only proceed once the LAST checkpoint exists, then give the supervisor a
+    # grace window -- a restart that is still coming would take the cards back.
+    if [ -d "$(iter_dir "$LAST")" ]; then
+      sleep 600
+      if trainer_running; then continue; fi
+      log "training idle and cp$LAST present -> evaluating"
+      return 0
+    fi
+    if [ "$waited" -ge "$cap" ]; then
+      log "WARN: waited ${MAX_WAIT_H}h without cp$LAST; evaluating what exists"
+      return 1
+    fi
+    sleep 300; waited=$(( waited + 5 ))
+    [ $(( waited % 60 )) -eq 0 ] && log "waiting for training (${waited}min elapsed)"
+  done
+}
+
+# The driver allocates the eval run's name up front and passes it in. Letting
+# eval_alfworld_ckpt.sh allocate would produce a name carrying only `cp<N>`, so the
+# dev64 and full evals of the same checkpoint would differ by timestamp alone and
+# the driver could not tell which log to read. The variant makes it deterministic
+# AND keeps the name inside the repo's one rule.
+eval_one() { # $1=iter $2=cfg $3=tag
+  local iter="$1" cfg="$2" tag="$3" name
+  name=$(python "$R/scripts/run_names.py" --allocate --task alfworld \
+           --model "$MODEL_SLUG" --method "$METHOD_SLUG" --variant "cp${iter}-${tag}") || return 1
+  log "eval start iter=$iter tag=$tag name=$name"
+  RUN_NAME="$name" EVAL_CONFIG="$cfg" METHOD_SLUG="$METHOD_SLUG" \
+    bash "$R/alfworld_hpi_v2/scripts/eval_alfworld_ckpt.sh" "$SRC" "$iter" >> "$PIPE_LOG" 2>&1
+  local rc=$?
+  echo "$iter $tag $name $rc" >> "$OUT/eval_index.txt"
+  log "eval done  iter=$iter tag=$tag rc=$rc"
+  return $rc
+}
+
+eval_log() { echo "$R/logs/$1.log"; }
+
+# success_rate, averaged over the datasets in the log, plus the per-dataset detail
+# (the full eval must report valid_seen and valid_unseen separately).
+success_rate() { # $1 = log path
+  python3 - "$1" <<'PY'
+import re, sys
+try:
+    txt = open(sys.argv[1], errors="replace").read()
+except OSError:
+    print(""); raise SystemExit
+rates = [float(m) for m in re.findall(r"\[v2-eval\][^\n]*success_rate=([0-9.]+)", txt)]
+print(f"{sum(rates)/len(rates):.4f}" if rates else "")
+PY
+}
+
+detail() { # $1 = log path
+  python3 - "$1" <<'PY'
+import re, sys
+try:
+    txt = open(sys.argv[1], errors="replace").read()
+except OSError:
+    print(""); raise SystemExit
+rows = re.findall(r"\[v2-eval\] (\S+): n=(\d+) success_rate=([0-9.]+)", txt)
+print("; ".join(f"{d} n={n} {r}" for d, n, r in rows))
+PY
+}
+
+log "pipeline start for $RUN (method=$METHOD_SLUG backbone=$BACKBONE iters=${ITERS[*]})"
+wait_for_training || true
+
+: > "$OUT/eval_index.txt"
+
+# ---- Stage A: frozen dev subset ---------------------------------------------
+for iter in "${ITERS[@]}"; do
+  if [ ! -d "$(iter_dir "$iter")" ]; then log "skip iter=$iter (no checkpoint)"; continue; fi
+  eval_one "$iter" "$DEV_CFG" dev64 || log "WARN dev64 eval failed at iter=$iter"
+done
+
+# ---- dev-best ----------------------------------------------------------------
+BEST_ITER=""; BEST_RATE=""
+while read -r iter tag name rc; do
+  [ "$tag" = "dev64" ] || continue
+  [ "$rc" = "0" ] || continue
+  rate=$(success_rate "$(eval_log "$name")")
+  [ -n "$rate" ] || continue
+  if [ -z "$BEST_RATE" ] || python3 -c "import sys; sys.exit(0 if float('$rate')>float('$BEST_RATE') else 1)"; then
+    BEST_ITER="$iter"; BEST_RATE="$rate"
+  fi
+done < "$OUT/eval_index.txt"
+log "dev-best: iter=${BEST_ITER:-none} rate=${BEST_RATE:-n/a}"
+
+# ---- Stage B: full ALFWorld --------------------------------------------------
+eval_one "$LAST" "$FULL_CFG" full || log "WARN full eval failed at iter=$LAST"
+if [ -n "$BEST_ITER" ] && [ "$BEST_ITER" != "$LAST" ]; then
+  eval_one "$BEST_ITER" "$FULL_CFG" "full-devbest" || log "WARN full eval failed at dev-best iter=$BEST_ITER"
+fi
+
+# ---- summary -----------------------------------------------------------------
+{
+  echo "# Eval summary -- $RUN"
+  echo
+  echo "Method slug: \`$METHOD_SLUG\`; backbone: $BACKBONE; model: $MODEL_SLUG."
+  echo
+  echo "Frozen dev subset: \`${DEV_DATA#$R/}\` "
+  echo "(md5 \`$(md5sum "$DEV_DATA" | cut -d' ' -f1)\`)."
+  echo "Full set: valid_seen 140 + valid_unseen 134."
+  echo "Protocol: default eval path (ARM=grpo, HPI=0) for BOTH arms -- identical for HSI and GRPO."
+  echo
+  echo "| iter | tag | success_rate (mean) | per-dataset | eval run |"
+  echo "|------|-----|--------------------:|-------------|----------|"
+  while read -r iter tag name rc; do
+    if [ "$rc" = "0" ]; then
+      rate=$(success_rate "$(eval_log "$name")")
+      det=$(detail "$(eval_log "$name")")
+    else
+      rate=""; det=""
+    fi
+    echo "| cp$iter | $tag | ${rate:-FAILED(rc=$rc)} | ${det:-—} | \`$name\` |"
+  done < "$OUT/eval_index.txt"
+  echo
+  echo "dev-best: cp${BEST_ITER:-none} (dev64 success rate ${BEST_RATE:-n/a})"
+  echo
+  echo "Every row passed \`eval_alfworld_ckpt.sh\`'s guard: a log without"
+  echo "\"successfully loaded checkpoint ... iteration N\" is VOID and is reported as FAILED."
+} > "$SUMMARY"
+
+touch "$DONE_MARK"
+log "pipeline complete -> $SUMMARY"

@@ -1,0 +1,499 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>opsd-slime 训练看板</title>
+<style>
+.viz-root {
+  color-scheme: light;
+  --surface-0: #f3f2ef; --surface-1: #fcfcfb; --border: #e2e1dc; --grid: #ecebe7;
+  --text-primary: #0b0b0b; --text-secondary: #52514e; --text-muted: #7a7974;
+  --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a;
+  --seq-track: #cde2fb;
+  --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) .viz-root {
+    color-scheme: dark;
+    --surface-0: #121211; --surface-1: #1a1a19; --border: #2f2f2d; --grid: #262624;
+    --text-primary: #f0efec; --text-secondary: #c3c2b7; --text-muted: #8f8e86;
+    --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --seq-track: #184f95;
+  }
+}
+:root[data-theme="dark"] .viz-root {
+  color-scheme: dark;
+  --surface-0: #121211; --surface-1: #1a1a19; --border: #2f2f2d; --grid: #262624;
+  --text-primary: #f0efec; --text-secondary: #c3c2b7; --text-muted: #8f8e86;
+  --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --seq-track: #184f95;
+}
+* { box-sizing: border-box; }
+body { margin: 0; }
+.viz-root { background: var(--surface-0); color: var(--text-primary); min-height: 100vh;
+  font: 13px/1.45 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+header { position: sticky; top: 0; z-index: 5; display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center;
+  padding: 10px 20px; background: var(--surface-1); border-bottom: 1px solid var(--border); }
+header h1 { font-size: 15px; margin: 0 12px 0 0; font-weight: 600; }
+header label { color: var(--text-secondary); display: flex; gap: 6px; align-items: center; }
+select, button { font: inherit; color: var(--text-primary); background: var(--surface-0); border: 1px solid var(--border);
+  border-radius: 6px; padding: 4px 8px; }
+button { cursor: pointer; }
+.spacer { flex: 1; }
+.muted { color: var(--text-muted); }
+.secondary { color: var(--text-secondary); }
+main { padding: 16px 20px 40px; display: grid; gap: 16px; max-width: 1680px; margin: 0 auto; }
+section.panel { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+section.panel > h2 { font-size: 14px; margin: 0 0 12px; font-weight: 600; display: flex; gap: 10px; align-items: baseline; }
+section.panel > h2 small { font-weight: 400; color: var(--text-muted); font-size: 12px; }
+.cols { display: grid; grid-template-columns: 1.25fr 1fr; gap: 18px; }
+@media (max-width: 1100px) { .cols { grid-template-columns: 1fr; } }
+h3 { font-size: 12px; font-weight: 600; color: var(--text-secondary); margin: 14px 0 8px; text-transform: none; }
+h3:first-child { margin-top: 0; }
+.stages { display: flex; gap: 6px; flex-wrap: wrap; }
+.stage { flex: 1 1 140px; border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; min-width: 140px; }
+.stage.active { border-color: var(--series-1); box-shadow: inset 0 0 0 1px var(--series-1); }
+.stage .sid { font-weight: 600; }
+.stage .res { color: var(--text-secondary); font-size: 12px; margin-top: 4px; }
+.pill { display: inline-flex; gap: 4px; align-items: center; font-size: 12px; padding: 1px 8px; border-radius: 999px;
+  border: 1px solid var(--border); color: var(--text-primary); white-space: nowrap; }
+.pill i { font-style: normal; font-weight: 700; }
+.pill.good i { color: var(--good); } .pill.warning i { color: var(--warning); }
+.pill.serious i { color: var(--serious); } .pill.critical i { color: var(--critical); } .pill.info i { color: var(--series-1); }
+.budget-hero { display: flex; align-items: baseline; gap: 8px; }
+.budget-hero b { font-size: 28px; font-weight: 600; }
+.meter { position: relative; height: 10px; background: var(--grid); border-radius: 5px; overflow: hidden; }
+.meter > span { position: absolute; left: 0; top: 0; bottom: 0; background: var(--series-1); border-radius: 5px; }
+.budget-rows { display: grid; grid-template-columns: 44px 1fr 112px; gap: 6px 10px; align-items: center; margin-top: 10px; }
+.budget-rows .meter > span.over { background: var(--critical); }
+ul.plain { list-style: none; margin: 0; padding: 0; display: grid; gap: 5px; }
+ul.plain li { display: flex; gap: 8px; }
+ul.plain li .d { color: var(--text-muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.kpis { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px; }
+.kpi { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+.kpi .k { color: var(--text-secondary); font-size: 12px; }
+.kpi .v { font-size: 22px; font-weight: 600; margin-top: 2px; font-variant-numeric: tabular-nums; }
+.kpi .s { color: var(--text-muted); font-size: 12px; margin-top: 2px; }
+.kpi .meter { margin-top: 6px; height: 6px; }
+.runhead { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; margin-bottom: 12px; }
+.runhead code { font-size: 12px; color: var(--text-secondary); }
+.alerts { display: grid; gap: 6px; margin-top: 12px; }
+.alert { display: flex; gap: 8px; align-items: baseline; padding: 6px 10px; border-radius: 6px; border: 1px solid var(--border); }
+.alert i { font-style: normal; font-weight: 700; }
+.alert.good i { color: var(--good); } .alert.warning i { color: var(--warning); }
+.alert.serious i { color: var(--serious); } .alert.critical i { color: var(--critical); }
+.group { margin-top: 6px; }
+.group > h3 { margin: 16px 0 8px; font-size: 13px; color: var(--text-primary); }
+.charts { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 10px; }
+.card { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px 6px; position: relative; }
+.card .ct { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+.card .ct .t { font-weight: 600; font-size: 12.5px; }
+.card .ct .key { color: var(--text-muted); font-size: 11px; }
+.card .last { font-size: 12px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+.card .tog { font-size: 11px; padding: 0 6px; border-radius: 4px; }
+.card svg { display: block; width: 100%; height: 150px; }
+.card .empty { height: 150px; display: grid; place-items: center; color: var(--text-muted); font-size: 12px; }
+.legend { display: flex; gap: 12px; font-size: 11.5px; color: var(--text-secondary); margin: 2px 0 0; }
+.legend span::before { content: ""; display: inline-block; width: 12px; height: 2px; margin-right: 5px; vertical-align: middle;
+  background: var(--c); }
+.tip { position: fixed; pointer-events: none; z-index: 20; background: var(--surface-1); color: var(--text-primary);
+  border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font-size: 12px; box-shadow: 0 4px 14px rgba(0,0,0,.14);
+  display: none; font-variant-numeric: tabular-nums; }
+.tip .sw { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: var(--c); }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--border); font-size: 12px; white-space: nowrap; }
+th { color: var(--text-secondary); font-weight: 600; }
+td.num, th.num { text-align: right; }
+tr.click { cursor: pointer; } tr.click:hover td { background: var(--surface-0); } tr.sel td { background: var(--surface-0); font-weight: 600; }
+.scroll { overflow: auto; max-height: 420px; }
+.bar { position: relative; display: inline-block; width: 80px; height: 8px; background: var(--grid); border-radius: 4px;
+  vertical-align: middle; margin-right: 6px; overflow: hidden; }
+.bar > span { position: absolute; left: 0; top: 0; bottom: 0; background: var(--series-1); border-radius: 4px; }
+pre.log { margin: 0; max-height: 300px; overflow: auto; font: 11.5px/1.5 ui-monospace, Consolas, monospace; white-space: pre-wrap;
+  word-break: break-all; color: var(--text-secondary); background: var(--surface-0); border-radius: 6px; padding: 8px 10px; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 1100px) { .grid2 { grid-template-columns: 1fr; } }
+.err { color: var(--critical); }
+</style>
+</head>
+<body>
+<div class="viz-root" id="root">
+<header>
+  <h1>opsd-slime 训练看板</h1>
+  <label>实验 <select id="runSel"></select></label>
+  <label>排序 <select id="runSort"><option value="modified">修改时间</option><option value="name">名称</option></select></label>
+  <button id="runOrder" type="button">降序</button>
+  <label>对比 <select id="cmpSel"><option value="">（无）</option></select></label>
+  <label><input type="checkbox" id="showAll"> 显示无数据运行</label>
+  <span class="spacer"></span>
+  <span class="muted" id="stamp"></span>
+  <label><input type="checkbox" id="auto" checked> 自动刷新 5 分钟</label>
+  <button id="refresh">刷新</button>
+  <button id="theme" title="切换明暗">◐</button>
+</header>
+<main>
+  <section class="panel" id="globalPanel"><h2>共享实验概览 <small id="planUpdated"></small></h2><div id="global"></div></section>
+  <section class="panel" id="runPanel"><h2>当前实验 <small id="runSub"></small></h2><div id="run"></div></section>
+  <section class="panel"><h2>训练指标 <small>x 轴沿用指标原始 step（Actor 为 train step）；蓝色为所选实验、橙色为对比实验</small></h2><div id="metrics"></div></section>
+  <section class="panel"><div class="grid2">
+    <div><h3>分批 / 分族成功率</h3><div id="families"></div></div>
+    <div><h3>课程难度分布与评测</h3><div id="curriculum"></div></div>
+  </div></section>
+  <section class="panel"><h2>关键日志 <small>只保留指标、保存、错误相关行</small></h2><pre class="log" id="log"></pre></section>
+  <section class="panel"><h2>历史实验 <small>点击切换</small></h2><div class="scroll" id="history"></div></section>
+</main>
+<div class="tip" id="tip"></div>
+</div>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+const STATUS = {
+  unknown: ["info", "?", "状态未记录"],
+  running:   ["info", "▶", "运行中"], completed: ["good", "✓", "完成"], failed: ["critical", "✕", "失败"],
+  partial:   ["warning", "◐", "部分完成"],
+  stopped:   ["warning", "■", "已停止"], prepared: ["warning", "○", "未提交"],
+};
+const pill = (cls, icon, text) => `<span class="pill ${cls}"><i>${icon}</i>${esc(text)}</span>`;
+const statusPill = (s, n) => {
+  const [c, i, label] = STATUS[s] || ["warning", "?", s];
+  return pill(c, i, s === "partial" && n ? `${label} · ${n} 次更新` : label);
+};
+const pct = (v, d = 1) => v == null ? "—" : (100 * v).toFixed(d) + "%";
+const fmt = {
+  pct: (v) => pct(v, 1), pct2: (v) => pct(v, 2), int: (v) => v == null ? "—" : Math.round(v).toLocaleString(),
+  num: (v) => v == null ? "—" : Math.abs(v) >= 100 ? v.toFixed(0) : Math.abs(v) >= 1 ? v.toFixed(3) : v.toPrecision(3),
+  sec: (v) => v == null ? "—" : v >= 3600 ? (v / 3600).toFixed(2) + " h" : v >= 60 ? (v / 60).toFixed(1) + " min" : v.toFixed(1) + " s",
+  gb: (v) => v == null ? "—" : v.toFixed(2) + " GB", w: (v) => v == null ? "—" : v.toFixed(0) + " W",
+};
+const dur = (s) => s == null ? "—" : s >= 3600 ? `${Math.floor(s / 3600)}h${String(Math.floor(s % 3600 / 60)).padStart(2, "0")}m`
+  : `${Math.floor(s / 60)}m${String(Math.floor(s % 60)).padStart(2, "0")}s`;
+const when = (t) => t ? new Date(t * 1000).toLocaleString("zh-CN", {hour12: false, month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit"}) : "—";
+
+// Metric catalog: [key, title, format, options]. Grouped the way verl/slime dashboards are usually read.
+const GROUPS = [
+  ["奖励与学习信号", [
+    ["episodes/train_success", "训练批成功率", "pct"],
+    ["derived/mixed_group_fraction", "混合奖励组比例（产生梯度的 G4 组）", "pct", {ref: 0.25, refLabel: "警戒 25%"}],
+    ["eval/dev", "dev96 贪心成功率", "pct", {baseKey: "dev96_commands_v2", refLabel: "初始基线"}],
+    ["eval/unseen", "unseen134 贪心成功率（held-out）", "pct", {baseKey: "unseen134_commands_v2", refLabel: "初始基线"}],
+    ["rollout/raw_reward", "raw reward 均值", "pct"],
+  ]],
+  ["策略优化（Actor）", [
+    ["train/loss", "Actor loss（原始训练归约值）", "num"],
+    ["train/srlvr_loss_sum", "SRLVR v2/v3：PPO+βKL token 总和 / 训练行数", "num"],
+    ["train/srlvr_reference_kl_sum", "SRLVR v2/v3：reference KL token 总和 / 训练行数", "num"],
+    ["train/srlvr_v4/reference_kl", "SRLVR v4 reference KL（日志归约值）", "num"],
+    ["train/srlvr_v4/mean_unclipped_kl", "SRLVR v4 未裁剪 KL（日志归约值）", "num"],
+    ["train/srlvr_v4/clipped_fraction", "SRLVR v4 clip（日志归约值）", "num"],
+    ["train/v2/pg_loss_mean", "GRPO PG loss（日志归约值）", "num"], ["train/v2/reference_kl_mean", "GRPO reference KL（日志归约值）", "num"],
+    ["train/v2/ppo_kl", "GRPO PPO KL（日志归约值）", "num"], ["train/v2/pg_clipfrac", "GRPO clip（日志归约值）", "num"],
+    ["train/entropy_loss", "熵", "num"], ["train/grad_norm", "梯度范数（裁剪前）", "num", {ref: 1, refLabel: "clip=1"}],
+  ]],
+  ["训推一致性门禁", [
+    ["gate/ratio_outside", "整批 ratio∉[0.8,1.2] 比例（8 rank 最大）", "pct2", {gateRef: true}],
+    ["gate/logprob_abs_mean", "|Δ logprob| 均值", "num"],
+    ["gate/normalized_ess", "归一化 ESS（8 rank 最小）", "num"],
+    ["train/train_rollout_logprob_abs_diff", "train/rollout logprob 差", "num"],
+  ]],
+  ["Episode 统计（与训练行分开）", [
+    ["episodes/completion_rate", "Episode 完成率", "pct"],
+    ["episodes/action_valid_rate", "动作有效率", "pct"],
+    ["episodes/duration_seconds/mean", "Episode 平均耗时", "sec"],
+    ["episodes/duration_seconds/min", "Episode 最短耗时", "sec"],
+    ["episodes/duration_seconds/max", "Episode 最长耗时", "sec"],
+    ["episodes/turns/mean", "Episode 平均 turn", "num"],
+    ["episodes/turns/min", "Episode 最少 turn", "int"],
+    ["episodes/turns/max", "Episode 最多 turn", "int"],
+    ["episodes/generated_tokens/mean", "Episode 生成 token 均值", "int"],
+    ["episodes/trajectory_tokens/mean", "Episode 初始 prompt + 生成 token 均值", "int"],
+    ["episodes/trajectory_tokens/min", "Episode 轨迹 token 最少", "int"],
+    ["episodes/trajectory_tokens/max", "Episode 轨迹 token 最多", "int"],
+    ["batch/generated_tokens", "整批生成 token 总数", "int"],
+  ]],
+  ["Rollout 与训练行", [
+    ["rollout/response_len/mean", "训练行 response token 均值（非 episode）", "int"],
+    ["rollout/response_len/max", "训练行 response token 最大", "int"],
+    ["rollout/total_lengths", "训练行总长度均值（prompt+response）", "int"],
+    ["rollout/truncated_ratio", "未自然终止比例", "pct"],
+    ["episodes/steps_per_episode", "每条 episode 平均 turn 数", "num"],
+    ["episodes/invalid_action_rate", "非法动作率", "pct"],
+  ]],
+  ["SRLVR 阶段耗时", [
+    ["srlvr/reference_seconds", "冻结 reference 阶段", "sec"],
+    ["srlvr/score_seconds", "Teacher scoring 阶段", "sec"],
+    ["srlvr/calibration_seconds", "Calibration 阶段", "sec"],
+    ["srlvr/actor_seconds", "Actor update 阶段（含该作用域收尾）", "sec"],
+  ]],
+  ["吞吐与耗时", [
+    ["perf/batch_wall_time", "端到端 batch 实测耗时", "sec"],
+    ["perf/actor_phase_time", "Actor 整阶段（含 ref/scoring/calibration）", "sec"],
+    ["perf/sync_communication_time", "同步通信实测耗时", "sec"],
+    ["perf/step_time", "框架 train + wait 耗时", "sec"], ["perf/rollout_time", "rollout 耗时", "sec"],
+    ["perf/actor_train_time", "actor 训练耗时", "sec"], ["perf/update_weights_time", "权重发布耗时", "sec"],
+    ["perf/tokens_per_gpu_per_sec", "tokens / 卡 / 秒", "num"], ["perf/wait_time_ratio", "训练等待占比", "pct"],
+  ]],
+  ["资源", [
+    ["perf/mem_device_used_GB", "NPU 显存已用", "gb"], ["perf/mem_device_free_GB", "NPU 显存剩余", "gb"],
+    ["perf/mem_host_used_GB", "主机内存已用", "gb"], ["perf/power_total_W", "8 卡总功耗", "w"],
+  ]],
+];
+
+const state = {overview: null, runs: [], sel: null, cmp: null, data: null, cmpData: null, tables: new Set()};
+
+async function get(url) {
+  const r = await fetch(url, {cache: "no-store"});
+  const body = await r.json();
+  if (!r.ok) throw new Error(body.error || r.status);
+  return body;
+}
+
+function visibleRuns() {
+  const key = $("runSort").value;
+  const direction = $("runOrder").dataset.ascending === "true" ? 1 : -1;
+  return state.runs.slice().sort((a, b) => direction * (key === "name"
+    ? a.run.localeCompare(b.run, "zh-CN", {numeric: true})
+    : (a.modified - b.modified) || a.run.localeCompare(b.run)));
+}
+function runLabel(r) {
+  return `${r.run} · ${when(r.modified)}`;
+}
+function fillSelectors() {
+  const runs = visibleRuns();
+  const opts = runs.map((r) => `<option value="${esc(r.run)}">${esc(runLabel(r))}</option>`).join("");
+  $("runSel").innerHTML = opts;
+  $("cmpSel").innerHTML = `<option value="">（无）</option>` + opts;
+  if (!state.sel || !runs.some((r) => r.run === state.sel)) {
+    const pick = runs.find((r) => r.status === "running") || runs.find((r) => r.has_metrics) || runs[0];
+    state.sel = pick && pick.run;
+  }
+  $("runSel").value = state.sel || "";
+  $("cmpSel").value = state.cmp || "";
+}
+
+// ---------- global ----------
+function renderGlobal() {
+  $("global").innerHTML = `<div class="secondary">共享 runs/ 中共 ${state.runs.length} 个实验；按目录名称和修改时间排序，可选择橙色对照曲线。根目录与 checkpoints/dashboard 自动合并，原始训练文件保持原位。</div>`;
+}
+
+// ---------- current run ----------
+const lastOf = (series, key) => { const s = series[key]; return s && s.length ? s[s.length - 1][1] : null; };
+function alertsFor(d) {
+  const out = [], m = d.meta, p = d.progress, s = d.series;
+  const applied = (m.updates_applied || []).length;
+  if (m.status === "failed") out.push(["critical", "✕", `运行失败，无有效更新：${m.error || "exit " + m.exit_code}`]);
+  if (m.status === "partial") out.push(["warning", "◐", `门禁中止前已完成 ${applied} 次有效更新（rollout ${m.updates_applied[0]}–${m.updates_applied[applied - 1]}），已存盘的部分不受影响`]);
+  const gate = d.gates.length ? d.gates[d.gates.length - 1] : null;
+  const limit = d.gate_threshold;
+  if (gate && !gate.passed) out.push(["critical", "✕", `rollout ${gate.rollout_id} 门禁未过：outside ${pct(gate.outside, 2)}${limit ? ` > ${pct(limit, 2)}` : ""}，该次更新被拒绝`]);
+  else if (gate && limit && gate.outside > 0.8 * limit) out.push(["warning", "!", `门禁余量小：outside ${pct(gate.outside, 2)}（阈值 ${pct(limit, 2)}）`]);
+  if (m.status === "running" && p.log_age_seconds > 900) out.push(["serious", "▲", `日志已 ${dur(p.log_age_seconds)} 无更新，可能卡住`]);
+  if (m.status === "running" && m.deadline && m.elapsed > 0.85 * m.deadline) out.push(["warning", "!", `已用 ${pct(m.elapsed / m.deadline, 0)} 的 deadline，可能在完成全部更新前被截止（已按每 2 次存盘）`]);
+  const mixed = lastOf(s, "derived/mixed_group_fraction");
+  if (mixed != null && mixed < 0.25) out.push(["warning", "!", `混合奖励组仅 ${pct(mixed)}，梯度信号偏少`]);
+  const free = lastOf(s, "perf/mem_device_free_GB");
+  if (free != null && free < 1.0) out.push(["serious", "▲", `NPU 剩余显存 ${free.toFixed(2)} GB，接近上限`]);
+  const dev = lastOf(s, "eval/dev"), base = (state.overview.plan.baselines || {}).dev96_commands_v2;
+  if (dev != null && base != null && dev < base - 0.03) out.push(["serious", "▲", `dev96 ${pct(dev)} 低于初始基线 ${pct(base)}`]);
+  if (m.stage === "E02" && m.status === "running" && p.updates_done >= 1 && !d.curriculum.length)
+    out.push(["critical", "✕", "已完成更新但没有 curriculum.jsonl：课程未生效"]);
+  if (!out.length) out.push(["info", "·", m.status === "unknown" ? "共享 run 的进程状态未记录；不使用本机 PID 判断其他服务器的运行状态" : "无已记录异常"]);
+  return out;
+}
+function kpi(k, v, s, frac) {
+  return `<div class="kpi"><div class="k">${esc(k)}</div><div class="v">${v}</div>${s ? `<div class="s">${s}</div>` : ""}${frac != null ? `<div class="meter"><span style="width:${Math.max(0, Math.min(100, 100 * frac))}%"></span></div>` : ""}</div>`;
+}
+function renderRun() {
+  const d = state.data;
+  if (!d) { $("run").innerHTML = `<span class="muted">没有可显示的实验</span>`; return; }
+  const m = d.meta, p = d.progress, s = d.series;
+  $("runSub").textContent = m.run;
+  const gate = d.gates.length ? d.gates[d.gates.length - 1] : null;
+  const ts = d.train_summary;
+  const lastBatch = d.batches.length ? d.batches[d.batches.length - 1] : null;
+  const expected = m.expected_updates;
+  const evalLast = lastOf(s, "eval/dev");
+  const head = `<div class="runhead">${statusPill(m.status, (m.updates_applied || []).length)}<b>${esc(m.stage)}</b>
+    <span>harness <b>${esc(m.harness)}</b></span><span>课程 <b>${esc(m.curriculum)}</b></span>
+    ${m.start_rollout != null ? `<span>rollout ${m.start_rollout} → ${m.start_rollout + (expected || 0)}</span>` : ""}
+    <span class="muted">启动 ${when(m.started)}</span>${d.checkpoint && d.checkpoint.path ? `<span class="muted">checkpoint</span><code>${esc(d.checkpoint.path)}</code>` : ""}</div>`;
+  const tiles = [
+    kpi("更新进度", expected ? `${p.updates_done} / ${expected}` : (m.eval_only ? "评测" : String(p.updates_done)),
+        p.last_metric_time ? `最近指标 ${esc(p.last_metric_time.slice(5))}` : "等待首个更新", expected ? p.updates_done / expected : null),
+    kpi("当前批采样", `${p.current_batch_episodes} / ${p.batch_size}`, `累计训练轨迹 ${p.train_episodes} · 评测 ${p.eval_episodes}`,
+        p.batch_size ? p.current_batch_episodes / p.batch_size : null),
+    kpi("运行时长", dur(m.elapsed), m.deadline ? `deadline ${dur(m.deadline)}` : "", m.deadline ? m.elapsed / m.deadline : null),
+    kpi("本次 NPU·h", m.npu_hours == null ? "—" : m.npu_hours.toFixed(2), "8 卡整机计费"),
+    kpi("最新批成功率", lastBatch && lastBatch.success_known ? pct(lastBatch.success / lastBatch.success_known) : "—",
+        ts && ts.success_known ? `累计 ${ts.success}/${ts.success_known} = ${pct(ts.success / ts.success_known)}` : ""),
+    kpi("混合奖励组", pct(lastOf(s, "derived/mixed_group_fraction")), "G4 组内奖励不全相同"),
+    kpi("门禁 outside", gate ? pct(gate.outside, 2) : "—",
+        gate ? `${gate.passed ? "✓ 通过" : "✕ 拒绝"} · ESS ${gate.ess.toFixed(4)} · ${gate.ranks} rank` : "阈值 1%"),
+    kpi("dev96 评测", evalLast == null ? "—" : pct(evalLast), `初始基线 ${pct((state.overview.plan.baselines || {}).dev96_commands_v2)}`),
+  ].join("");
+  const alerts = alertsFor(d).map(([c, i, t]) => `<div class="alert ${c}"><i>${i}</i><span>${esc(t)}</span></div>`).join("");
+  $("run").innerHTML = head + `<div class="kpis">${tiles}</div><div class="alerts">${alerts}</div>`;
+}
+
+// ---------- charts ----------
+function lineChart(card, defs, options) {
+  const host = card.querySelector(".plot");
+  const all = defs.flatMap((d) => d.points);
+  if (!all.length) { host.innerHTML = `<div class="empty">等待数据</div>`; return; }
+  const W = Math.max(280, host.clientWidth || 320), H = 150, L = 50, R = 12, T = 10, B = 22;
+  const xs = all.map((p) => p[0]); let ys = all.map((p) => p[1]);
+  if (options.ref != null) ys = ys.concat([options.ref]);
+  let x0 = Math.min(...xs), x1 = Math.max(...xs); if (x0 === x1) { x0 -= 1; x1 += 1; }
+  let y0 = Math.min(...ys), y1 = Math.max(...ys);
+  if (options.fmt === "pct" || options.fmt === "pct2" || y0 >= 0) y0 = Math.min(0, y0);
+  if (y0 === y1) { y1 = y0 + (Math.abs(y0) || 1) * 0.2; }
+  y1 += (y1 - y0) * 0.08;
+  const sx = (x) => L + (x - x0) / (x1 - x0) * (W - L - R), sy = (y) => T + (1 - (y - y0) / (y1 - y0)) * (H - T - B);
+  const f = fmt[options.fmt] || fmt.num;
+  let g = "";
+  for (let i = 0; i <= 3; i++) {
+    const v = y0 + (y1 - y0) * i / 3, y = sy(v);
+    g += `<line x1="${L}" x2="${W - R}" y1="${y}" y2="${y}" stroke="var(--grid)"/><text x="${L - 6}" y="${y + 3.5}" text-anchor="end" font-size="10" fill="var(--text-muted)">${esc(f(v))}</text>`;
+  }
+  const ticks = [...new Set(xs)].sort((a, b) => a - b);
+  const step = Math.ceil(ticks.length / 8);
+  ticks.filter((_, i) => i % step === 0).forEach((x) => { g += `<text x="${sx(x)}" y="${H - 6}" text-anchor="middle" font-size="10" fill="var(--text-muted)">${x}</text>`; });
+  if (options.ref != null) {
+    const y = sy(options.ref);
+    g += `<line x1="${L}" x2="${W - R}" y1="${y}" y2="${y}" stroke="var(--text-secondary)" stroke-dasharray="4 4" stroke-width="1"/>
+          <text x="${L + 4}" y="${y - 4}" text-anchor="start" font-size="10" fill="var(--text-secondary)">${esc(options.refLabel || "")}</text>`;
+  }
+  defs.forEach((d) => {
+    if (!d.points.length) return;
+    const path = d.points.map((p, i) => `${i ? "L" : "M"}${sx(p[0]).toFixed(1)},${sy(p[1]).toFixed(1)}`).join("");
+    g += `<path d="${path}" fill="none" stroke="${d.color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+    d.points.forEach((p) => { g += `<circle cx="${sx(p[0])}" cy="${sy(p[1])}" r="4" fill="${d.color}" stroke="var(--surface-1)" stroke-width="2"/>`; });
+  });
+  g += `<line class="xh" x1="0" x2="0" y1="${T}" y2="${H - B}" stroke="var(--text-muted)" stroke-width="1" visibility="hidden"/>
+        <rect x="${L}" y="${T}" width="${W - L - R}" height="${H - T - B}" fill="transparent"/>`;
+  host.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="${esc(options.title)}">${g}</svg>`;
+  const svg = host.querySelector("svg"), xh = svg.querySelector(".xh"), tip = $("tip");
+  svg.addEventListener("mousemove", (e) => {
+    const box = svg.getBoundingClientRect(), x = x0 + ((e.clientX - box.left) * W / box.width - L) / (W - L - R) * (x1 - x0);
+    const near = ticks.reduce((a, b) => Math.abs(b - x) < Math.abs(a - x) ? b : a, ticks[0]);
+    xh.setAttribute("x1", sx(near)); xh.setAttribute("x2", sx(near)); xh.setAttribute("visibility", "visible");
+    const rows = defs.map((d) => { const p = d.points.find((q) => q[0] === near);
+      return p ? `<div><span class="sw" style="--c:${d.color}"></span>${esc(d.name)}：<b>${esc(f(p[1]))}</b></div>` : ""; }).join("");
+    tip.innerHTML = `<div class="muted">step ${near}</div>${rows}`; tip.style.display = "block";
+    tip.style.left = Math.min(window.innerWidth - 220, e.clientX + 14) + "px"; tip.style.top = (e.clientY + 12) + "px";
+  });
+  svg.addEventListener("mouseleave", () => { xh.setAttribute("visibility", "hidden"); tip.style.display = "none"; });
+}
+function tableView(card, defs, f) {
+  const xs = [...new Set(defs.flatMap((d) => d.points.map((p) => p[0])))].sort((a, b) => a - b);
+  card.querySelector(".plot").innerHTML = xs.length ? `<div class="scroll" style="max-height:150px"><table><tr><th>rollout</th>${defs.map((d) => `<th class="num">${esc(d.name)}</th>`).join("")}</tr>${
+    xs.map((x) => `<tr><td>${x}</td>${defs.map((d) => { const p = d.points.find((q) => q[0] === x); return `<td class="num">${p ? esc(f(p[1])) : ""}</td>`; }).join("")}</tr>`).join("")}</table></div>`
+    : `<div class="empty">等待数据</div>`;
+}
+function renderMetrics() {
+  const d = state.data; if (!d) { $("metrics").innerHTML = ""; return; }
+  const c = state.cmpData, base = state.overview.plan.baselines || {};
+  const groups = GROUPS.map(([title, metrics]) => [title,
+    (title === "策略优化（Actor）" || title === "SRLVR 阶段耗时")
+      ? metrics.filter(([key]) => (d.series[key] || []).length || (c && (c.series[key] || []).length)) : metrics
+  ]).filter(([, metrics]) => metrics.length);
+  const html = groups.map(([title, metrics]) => `<div class="group"><h3>${esc(title)}</h3>${title === "策略优化（Actor）" ? '<p class="muted">归约口径：SRLVR v2/v3 按轨迹平均 token 总和，GRPO 默认先取轨迹内 token 均值再按轨迹平均，SRLVR v4 按全批 token 平均。v2/v3 的两个日志字段另除以训练行数（含 padding）；GRPO/v4 的微批均值诊断还会被框架除以全批 token 计数，不能直接当作均值或百分比。梯度范数来自实际归一化目标，记录于裁剪前。</p>' : ""}<div class="charts">${metrics.map(([key, t]) =>
+    `<div class="card" data-key="${esc(key)}"><div class="ct"><span class="t">${esc(t)}</span><button class="tog">${state.tables.has(key) ? "图" : "表"}</button></div>
+     <div class="ct"><span class="key">${esc(key)}</span><span class="last"></span></div><div class="plot"></div><div class="legend"></div></div>`).join("")}</div></div>`).join("");
+  $("metrics").innerHTML = html;
+  groups.forEach(([, metrics]) => metrics.forEach(([key, title, f, opt = {}]) => {
+    const card = $("metrics").querySelector(`.card[data-key="${CSS.escape(key)}"]`);
+    const defs = [{name: d.meta.short, color: "var(--series-1)", points: d.series[key] || []}];
+    if (c) defs.push({name: c.meta.short, color: "var(--series-2)", points: c.series[key] || []});
+    const options = {fmt: f, title, ref: opt.ref, refLabel: opt.refLabel};
+    if (opt.gateRef) { options.ref = d.gate_threshold; options.refLabel = d.gate_threshold_label; }
+    if (opt.baseKey && base[opt.baseKey] != null) { options.ref = base[opt.baseKey]; options.refLabel = `${opt.refLabel} ${pct(base[opt.baseKey])}`; }
+    const last = defs[0].points.length ? defs[0].points[defs[0].points.length - 1][1] : null;
+    card.querySelector(".last").textContent = last == null ? "" : "最新 " + (fmt[f] || fmt.num)(last);
+    if (c) card.querySelector(".legend").innerHTML = defs.map((x) => `<span style="--c:${x.color}">${esc(x.name)}</span>`).join("");
+    const draw = () => state.tables.has(key) ? tableView(card, defs, fmt[f] || fmt.num) : lineChart(card, defs, options);
+    card.querySelector(".tog").onclick = (e) => { state.tables.has(key) ? state.tables.delete(key) : state.tables.add(key);
+      e.target.textContent = state.tables.has(key) ? "图" : "表"; draw(); };
+    draw();
+  }));
+}
+
+// ---------- families / curriculum / log / history ----------
+const FAM = {pick_and_place_simple: "pick&place", look_at_obj_in_light: "look_at", pick_clean_then_place_in_recep: "clean",
+  pick_heat_then_place_in_recep: "heat", pick_cool_then_place_in_recep: "cool", pick_two_obj_and_place: "two_obj"};
+const cell = (ok, n) => n ? `<span class="bar"><span style="width:${100 * ok / n}%"></span></span>${ok}/${n}` : `<span class="muted">—</span>`;
+function renderFamilies() {
+  const d = state.data; if (!d) { $("families").innerHTML = ""; return; }
+  const fams = Object.keys(FAM);
+  const rows = d.batches.map((b) => `<tr><td>${b.batch}${b.complete ? "" : ` <span class="muted">(进行中)</span>`}</td><td class="num">${b.success}/${b.n}</td>${
+    fams.map((f) => `<td>${cell(...(b.families[f] || [0, 0]))}</td>`).join("")}<td class="num">${pct(b.invalid / Math.max(1, b.steps))}</td></tr>`).join("");
+  const evalRows = d.eval_blocks.filter(Boolean).map((b) => `<tr><td>评测 ${esc(b.label)}${b.n < (b.label.startsWith("dev") ? 96 : 134) ? ` <span class="muted">(进行中)</span>` : ""}</td><td class="num">${b.success}/${b.n}</td>${
+    fams.map((f) => `<td>${cell(...(b.families[f] || [0, 0]))}</td>`).join("")}<td class="num">${pct(b.invalid / Math.max(1, b.steps))}</td></tr>`).join("");
+  $("families").innerHTML = rows || evalRows ? `<div class="scroll"><table><tr><th>batch</th><th class="num">成功</th>${fams.map((f) => `<th>${FAM[f]}</th>`).join("")}<th class="num">非法</th></tr>${rows}${evalRows}</table></div>`
+    : `<span class="muted">此实验没有 episode 记录</span>`;
+}
+function renderCurriculum() {
+  const d = state.data; if (!d) { $("curriculum").innerHTML = ""; return; }
+  let html = "";
+  if (d.curriculum.length) {
+    const last = d.curriculum[d.curriculum.length - 1], diff = last.difficulty || {};
+    const total = Object.values(diff).reduce((a, b) => a + b, 0) || 1;
+    const order = ["unknown", "hard", "frontier", "mastered"], name = {unknown: "未观测", hard: "hard (p<0.2)", frontier: "frontier", mastered: "mastered (p>0.8)"};
+    html += `<div class="secondary">最近一次课程更新：draws ${last.draws}，已观测任务 ${last.observed_tasks}，奖励筛题 ${last.reward_filtering ? "开" : "关"}</div>
+      <table style="margin-top:6px">${order.filter((k) => diff[k] != null).map((k) => `<tr><td>${name[k]}</td><td><span class="bar" style="width:160px"><span style="width:${100 * diff[k] / total}%"></span></span>${diff[k]}</td></tr>`).join("")}</table>`;
+    if (d.curriculum.length > 1) html += `<div class="muted" style="margin-top:6px">共 ${d.curriculum.length} 次课程更新记录</div>`;
+  } else {
+    html += `<div class="muted">${d.meta.curriculum && d.meta.curriculum !== "-" ? "尚无 curriculum.jsonl（首个训练批完成后写出）" : "此实验未启用课程采样"}</div>`;
+  }
+  const t = d.train_summary;
+  if (t) {
+    html += `<h3>轨迹终止原因（训练）</h3><table>${Object.entries(t.terminal).sort((a, b) => b[1] - a[1]).map(([k, v]) => `<tr><td>${esc(k)}</td><td class="num">${v}</td><td class="num">${pct(v / t.n)}</td></tr>`).join("")}</table>
+      <div class="muted" style="margin-top:4px">轨迹 token p50 ${fmt.int(t.tokens_p50)} · max ${fmt.int(t.tokens_max)} · 非法动作 ${pct(t.invalid / Math.max(1, t.steps))}</div>`;
+  }
+  $("curriculum").innerHTML = html;
+}
+function renderLog() {
+  const d = state.data; if (!d) { $("log").textContent = ""; return; }
+  const lines = d.log_tail.length ? d.log_tail : d.raw_tail;
+  $("log").textContent = lines.join("\n") || "（无日志）";
+  $("log").scrollTop = $("log").scrollHeight;
+}
+function renderHistory() {
+  const runs = visibleRuns();
+  $("history").innerHTML = `<table><tr><th>启动</th><th>阶段</th><th>运行</th><th>harness</th><th>课程</th><th>状态</th><th class="num">episodes</th><th class="num">时长</th><th class="num">NPU·h</th><th>备注</th></tr>${
+    runs.map((r) => `<tr class="click ${r.run === state.sel ? "sel" : ""}" data-run="${r.run}"><td>${when(r.started || r.mtime)}</td><td>${esc(r.stage)}</td><td>${esc(r.short)}</td><td>${esc(r.harness)}</td><td>${esc(r.curriculum)}</td><td>${statusPill(r.status, (r.updates_applied || []).length)}</td><td class="num">${r.episodes}</td><td class="num">${dur(r.elapsed)}</td><td class="num">${r.npu_hours == null ? "—" : r.npu_hours.toFixed(2)}</td><td class="muted">${esc((r.error || "").slice(0, 80))}</td></tr>`).join("")}</table>`;
+  $("history").querySelectorAll("tr.click").forEach((tr) => tr.onclick = () => { state.sel = tr.dataset.run; $("runSel").value = state.sel; load(true); window.scrollTo({top: $("runPanel").offsetTop - 60, behavior: "smooth"}); });
+}
+
+async function load(runOnly = false) {
+  try {
+    if (!runOnly) {
+      [state.overview, state.runs] = await Promise.all([get("/api/overview"), get("/api/runs")]);
+      fillSelectors(); renderGlobal();
+    }
+    state.data = state.sel ? await get("/api/run/" + encodeURIComponent(state.sel)) : null;
+    state.cmpData = state.cmp && state.cmp !== state.sel ? await get("/api/run/" + encodeURIComponent(state.cmp)) : null;
+    renderRun(); renderMetrics(); renderFamilies(); renderCurriculum(); renderLog(); renderHistory();
+    $("stamp").textContent = "更新于 " + new Date().toLocaleTimeString("zh-CN", {hour12: false});
+  } catch (e) {
+    $("stamp").innerHTML = `<span class="err">加载失败：${esc(e.message)}</span>`;
+  }
+}
+
+$("runSel").onchange = (e) => { state.sel = e.target.value; load(true); };
+$("cmpSel").onchange = (e) => { state.cmp = e.target.value || null; load(true); };
+$("showAll").onchange = () => { fillSelectors(); renderHistory(); };
+$("runSort").onchange = () => { fillSelectors(); renderHistory(); };
+$("runOrder").onclick = (e) => { const asc = e.target.dataset.ascending !== "true"; e.target.dataset.ascending = String(asc); e.target.textContent = asc ? "升序" : "降序"; fillSelectors(); renderHistory(); };
+$("refresh").onclick = () => load();
+$("theme").onclick = () => {
+  const cur = document.documentElement.dataset.theme || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+  document.documentElement.dataset.theme = cur === "dark" ? "light" : "dark";
+  localStorage.setItem("theme", document.documentElement.dataset.theme);
+};
+if (localStorage.getItem("theme")) document.documentElement.dataset.theme = localStorage.getItem("theme");
+let resizeTimer; window.addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(renderMetrics, 150); });
+setInterval(() => { if ($("auto").checked && !document.hidden) load(); }, 300000);
+load();
+</script>
+</body>
+</html>
