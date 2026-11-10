@@ -1,4 +1,4 @@
-"""SRLVR_ADVANTAGE_MODE: history (default) vs REINFORCE++-style batch statistics.
+"""SRLVR_ADVANTAGE_MODE: REINFORCE++-style batch (default) vs history statistics.
 
 The SRLVR actor advantage is ``A = (R - b - 1_U * lambda * B) / s``. The published
 method takes ``b`` and ``s`` from the calibration history window. With one
@@ -41,9 +41,9 @@ def test_modes_are_the_documented_pair():
     assert ADVANTAGE_MODES == ("history", "batch")
 
 
-def test_default_is_history(monkeypatch):
+def test_default_is_batch(monkeypatch):
     monkeypatch.delenv("SRLVR_ADVANTAGE_MODE", raising=False)
-    assert advantage_mode() == "history"
+    assert advantage_mode() == "batch"
 
 
 def test_unknown_mode_fails_closed(monkeypatch):
@@ -153,6 +153,7 @@ def test_lambda_bound_uses_the_baseline_actually_in_use():
 
 
 def test_next_batch_lambda_is_frozen_from_calibration_and_clipped(monkeypatch):
+    monkeypatch.setenv("SRLVR_ADVANTAGE_MODE", "history")
     cfg = Settings(variant="v2", gamma=.99, calibration=2, rho=.9)
     state = dict(b=.4, s=.5, history=[], last_rollout=4, actor_optimizer_steps=5,
                  reduction="trajectory_token_mean_v1", advantage_mode="history",

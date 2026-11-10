@@ -8,6 +8,7 @@ Run: python -m pytest tests/test_optim_sidecar.py -q
 """
 
 import os
+import ast
 import sys
 from pathlib import Path
 
@@ -19,6 +20,24 @@ if str(PROJ) not in sys.path:
     sys.path.insert(0, str(PROJ))
 
 from methods import optim_sidecar as sc  # noqa: E402
+
+
+def test_training_initialization_propagates_missing_sidecar_error(monkeypatch):
+    source = ast.parse((PROJ / 'frameworks/slime-ascend/slime/backends/megatron_utils/model.py').read_text())
+    fn = next(n for n in source.body if isinstance(n, ast.FunctionDef)
+              and n.name == 'initialize_model_and_optimizer')
+    from types import SimpleNamespace
+    namespace = dict(Namespace=object, DDP=object, MegatronOptimizer=object,
+                    OptimizerParamScheduler=object, RolloutBatch=dict,
+                    torch=SimpleNamespace(version=SimpleNamespace(hip=False)),
+                    setup_model_and_optimizer=lambda args, role: ([SimpleNamespace()], object(), object()),
+                    clear_memory=lambda: None, load_checkpoint=lambda *a, **kw: (4,None))
+    def missing(*args):
+        raise sc.SidecarError('no sidecar')
+    monkeypatch.setattr(sc, 'restore_if_enabled', missing)
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), '<model-initialization>', 'exec'), namespace)
+    with pytest.raises(sc.SidecarError, match='no sidecar'):
+        namespace['initialize_model_and_optimizer'](SimpleNamespace(load='saved-run'))
 
 
 class FakeMegatronOptimizer:

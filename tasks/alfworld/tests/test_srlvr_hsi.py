@@ -435,3 +435,116 @@ def test_initial_reference_kl_enters_actor_gradient_but_not_raw_probe(monkeypatc
                           torch.autograd.grad(expected, lp)[0])
     assert torch.autograd.grad(actual, ref, allow_unused=True)[0] is None
     assert metrics['srlvr_reference_kl_sum'] == pytest.approx(0. if probe else float((kl.detach()*mask).sum()*2/7))
+
+
+# --- stale-policy (asynchronous rollout) contract -------------------------
+
+def _rows_with_versions(*versions):
+    return [dict(meta=dict(policy_version=v)) for v in versions]
+
+
+def test_resolve_policy_gap_accepts_one_step_stale():
+    # Arrange: an async batch generated one weight version behind rollout 5.
+    rows = _rows_with_versions(4, 4)
+    # Act
+    behavior, gap = method.resolve_policy_gap(rows, rollout_id=5, max_stale=1)
+    # Assert
+    assert (behavior, gap) == (4, 1)
+
+
+def test_resolve_policy_gap_accepts_on_policy_batch():
+    rows = _rows_with_versions(7, 7, 7)
+    assert method.resolve_policy_gap(rows, rollout_id=7, max_stale=1) == (7, 0)
+
+
+def test_resolve_policy_gap_rejects_mixed_snapshots():
+    rows = _rows_with_versions(4, 5)
+    with pytest.raises(RuntimeError, match="mixed rollout snapshots"):
+        method.resolve_policy_gap(rows, rollout_id=5, max_stale=1)
+
+
+def test_resolve_policy_gap_rejects_gap_beyond_max_stale():
+    # A two-version gap is outside the truncated-IS contract.
+    with pytest.raises(RuntimeError, match="exceeds max_stale"):
+        method.resolve_policy_gap(_rows_with_versions(3), rollout_id=5, max_stale=1)
+
+
+def test_resolve_policy_gap_rejects_future_policy():
+    with pytest.raises(RuntimeError, match="future policy"):
+        method.resolve_policy_gap(_rows_with_versions(6), rollout_id=5, max_stale=1)
+
+
+def test_settings_reject_deeper_than_one_step_staleness():
+    with pytest.raises(ValueError, match="stale policy"):
+        replace(method.Settings("v2", 0.99), stale_lag=2, max_stale=2).validate()
+    with pytest.raises(ValueError, match="stale policy"):
+        replace(method.Settings("v2", 0.99), stale_lag=2, max_stale=1).validate()
+    # One-step lag is the only supported asynchronous protocol.
+    replace(method.Settings("v2", 0.99), stale_lag=1, max_stale=1).validate()
+
+
+def test_attach_rows_stamps_generation_version(monkeypatch):
+    # Arrange: async lag stamps the batch with rollout_id - 1.
+    monkeypatch.setenv("SRLVR_VARIANT", "v2")
+    monkeypatch.setenv("SRLVR_STALE_LAG", "1")
+    rows = [SimpleNamespace(response_length=2, loss_mask=[1, 1],
+                            metadata={"hsi_teacher_view": ([1, 2], 1, 1)})]
+    episode = SimpleNamespace(turns=[SimpleNamespace(turn_idx=0, episode_id="e")],
+                              reward=1.0)
+    # Act
+    method.attach_rows(rows, episode, group_id=0, rollout_id=5)
+    # Assert
+    assert rows[0].metadata["srlvr"]["policy_version"] == 4
+    assert rows[0].metadata["srlvr"]["trajectory_id"] == "5:e"
+
+
+def test_attach_rows_first_async_rollout_stays_on_policy(monkeypatch):
+    # The first async rollout is generated before any weight update, so even
+    # with the lag armed it must be stamped with its own version.
+    monkeypatch.setenv("SRLVR_VARIANT", "v2")
+    monkeypatch.setenv("SRLVR_STALE_LAG", "1")
+    rows = [SimpleNamespace(response_length=2, loss_mask=[1, 1],
+                            metadata={"hsi_teacher_view": ([1, 2], 1, 1)})]
+    episode = SimpleNamespace(turns=[SimpleNamespace(turn_idx=0, episode_id="e")],
+                              reward=1.0)
+    method.attach_rows(rows, episode, group_id=0, rollout_id=0, start_rollout_id=0)
+    assert rows[0].metadata["srlvr"]["policy_version"] == 0
+
+
+# --- output-head selection and probe scheduling ---------------------------
+
+def test_lm_head_weight_prefers_output_layer_when_untied():
+    from types import SimpleNamespace
+    from methods.hsi2_jsd import _lm_head_weight
+    head = SimpleNamespace(weight=torch.zeros(4, 2))
+    embed = torch.ones(4, 2)
+    model = SimpleNamespace(shared_embedding_or_output_weight=lambda: embed)
+    assert _lm_head_weight(model, head) is head.weight
+
+
+def test_lm_head_weight_falls_back_to_shared_embedding_when_tied():
+    from types import SimpleNamespace
+    from methods.hsi2_jsd import _lm_head_weight
+    embed = torch.ones(4, 2)
+    model = SimpleNamespace(shared_embedding_or_output_weight=lambda: embed)
+    assert _lm_head_weight(model, SimpleNamespace()) is embed
+
+
+def _probe_traj(half_tokens, has_y=True):
+    rows = [dict(tokens=[0] * half_tokens, mask=[1], meta=dict(B=1.)) for _ in range(2)]
+    rows[-1]["meta"]["B"] = 1. if has_y else 0.
+    return rows
+
+
+def test_balanced_probe_assignment_picks_lowest_peak():
+    from methods.srlvr_hsi import assign_balanced_probe_positions
+    # workloads 2*[100, 10, 10, 100]; pairing (03)(12) is worst (200 vs 40)
+    trajectories = {i: _probe_traj(w // 2) for i, w in enumerate([100, 10, 10, 100])}
+    assert assign_balanced_probe_positions(trajectories, 4, 0, 2) == [0, 1]
+    assert assign_balanced_probe_positions(trajectories, 4, 1, 2) == [2, 3]
+
+
+def test_balanced_probe_assignment_falls_back_for_other_dp():
+    from methods.srlvr_hsi import assign_balanced_probe_positions
+    trajectories = {i: _probe_traj(10) for i in range(4)}
+    assert assign_balanced_probe_positions(trajectories, 4, 1, 4) == [1]

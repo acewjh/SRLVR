@@ -172,6 +172,9 @@ const when = (t) => t ? new Date(t * 1000).toLocaleString("zh-CN", {hour12: fals
 // Metric catalog: [key, title, format, options]. Grouped the way verl/slime dashboards are usually read.
 const GROUPS = [
   ["奖励与学习信号", [
+    ["rollout/reward", "GUI rollout reward 均值", "num"],
+    ["rollout/parse_failures", "GUI 解析失败均值", "num"],
+    ["rollout/turns", "GUI 平均 turns", "num"],
     ["episodes/train_success", "训练批成功率", "pct"],
     ["derived/mixed_group_fraction", "混合奖励组比例（产生梯度的 G4 组）", "pct", {ref: 0.25, refLabel: "警戒 25%"}],
     ["eval/dev", "dev96 贪心成功率", "pct", {baseKey: "dev96_commands_v2", refLabel: "初始基线"}],

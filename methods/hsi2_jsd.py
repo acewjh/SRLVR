@@ -216,16 +216,24 @@ def _find_lm_head(model):
 
 
 def _lm_head_weight(model, head):
-    """The ``[V, H]`` matrix the head applies, tied or not."""
+    """The ``[V, H]`` matrix the head actually applies, tied or not.
+
+    Prefer the output layer's own weight. Megatron builds a weightless output
+    layer only when the embeddings are tied; then fall back to the shared
+    embedding weight, which is the same matrix the head consumes. Never ask
+    ``shared_embedding_or_output_weight()`` first: with PP=1 that helper returns
+    the *input embedding* whenever ``pre_process`` is true, and under
+    ``--untie-embeddings-and-output-weights`` that is a different matrix.
+    """
+    weight = getattr(head, "weight", None)
+    if weight is not None:
+        return weight
     getter = getattr(model, "shared_embedding_or_output_weight", None)
     if callable(getter):
         weight = getter()
         if weight is not None:
             return weight
-    weight = getattr(head, "weight", None)
-    if weight is None:
-        raise RuntimeError("HSI v2: the actor's output layer exposes no weight matrix")
-    return weight
+    raise RuntimeError("HSI v2: the actor's output layer exposes no weight matrix")
 
 
 class _HiddenTap:

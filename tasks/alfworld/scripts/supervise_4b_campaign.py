@@ -237,7 +237,7 @@ def main():
                        MODEL_PROVIDER_PATH="tasks.alfworld.memory_provider.custom_model_provider",
                        RECOMPUTE_NUM_LAYERS="36", RECOMPUTE_LOSS="1", RESUME_WEIGHTS_ONLY="0",
                        G="8", ROLLOUT_BS="4", GBS_OVERRIDE="32", HISTORY_LENGTH="0", MAX_TURNS="50",
-                       SEQ_LENGTH="32768", SEED="42", TP="1", EPS_CLIP_HIGH="0.2", LR="1e-6",
+                       SEQ_LENGTH="32768", SEED="42", TP="2", EPS_CLIP_HIGH="0.2", LR="1e-6",
                        MODEL=str(PROJECT.parents[1] / "checkpoints/Qwen3-4B"))
             if cp:
                 env["RESUME_FROM"] = cp["load_path"]

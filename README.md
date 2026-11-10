@@ -97,6 +97,14 @@ ALFWORLD_ENV_ACTORS=1 ALFWORLD_ENV_WORKERS=32   # 缺这两个并发会退化到
 | `docs/` | 设计文档与实验结果；`docs/data/` 是逐轮原始指标 |
 | `tests/` | 单元测试，含分层检查与 DP 梯度聚合测试 |
 
+补充材料：
+
+| 文档 | 内容 |
+|---|---|
+| [`SRLVR_SCORE_REVIEW_20261105.md`](SRLVR_SCORE_REVIEW_20261105.md) | score 阶段耗时归因：8B 慢 1.8× 完全由并行几何与模型宽度解释，非实现退化 |
+| [`SRLVR_V2_8B_PERF_DIAG_20261106.md`](SRLVR_V2_8B_PERF_DIAG_20261106.md) | 8B 单 run 的逐段性能诊断材料 |
+| [`docs/SRLVR_GAMMA_SWEEP.md`](docs/SRLVR_GAMMA_SWEEP.md) | γ 消融指南。注意 B 不归一化，γ 同时改变回看覆盖与幅度 |
+
 ## 依赖
 
 训练栈为 slime（Ray）+ Megatron-LM + SGLang，在 Ascend NPU 上另需 MindSpeed。这些**不包含在本仓库**，环境搭建见 [`docs/ENV_SETUP.md`](docs/ENV_SETUP.md)。

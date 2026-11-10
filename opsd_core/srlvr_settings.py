@@ -20,6 +20,11 @@ class Settings:
     actor_lambda_zero: bool = False
     trajectory_uniform_b: bool = False
     teacher_outcome_only: bool = False
+    # Asynchronous rollout: the weights that generated a batch can be one
+    # version behind the actor that trains it. `stale_lag` stamps that distance;
+    # `max_stale` is the largest gap the truncated importance ratio may cover.
+    stale_lag: int = 0
+    max_stale: int = 1
 
     @classmethod
     def from_env(cls):
@@ -27,7 +32,8 @@ class Settings:
             raise ValueError("SRLVR-v2/v3 require empirical second-moment calibration")
         values = dict(variant=os.environ.get("SRLVR_VARIANT", ""), gamma=float(os.environ.get("SRLVR_GAMMA") or "0.99"))
         for name, typ in (("calibration", int), ("rho", float), ("window", int),
-                          ("eps_b0", float), ("delta_s", float)):
+                          ("eps_b0", float), ("delta_s", float),
+                          ("stale_lag", int), ("max_stale", int)):
             if os.environ.get("SRLVR_" + name.upper()):
                 values[name] = typ(os.environ["SRLVR_" + name.upper()])
         values["position_chunk"] = int(os.environ.get("SRLVR_POSITION_CHUNK") or os.environ.get("OPSD_HSI2_POS_CHUNK") or 64)
@@ -50,6 +56,10 @@ class Settings:
         if not (self.calibration >= 2 and 0 < self.rho < 1 and self.window >= 1
                 and 0 < self.eps_b0 < .5 and self.delta_s > 0 and self.position_chunk >= 1):
             raise ValueError("invalid SRLVR-v2/v3 calibration, history, or position chunk settings")
+        if not (0 <= self.stale_lag <= self.max_stale <= 1):
+            raise ValueError(
+                "SRLVR stale policy needs 0 <= stale_lag <= max_stale <= 1; "
+                "deeper staleness is outside the truncated-IS contract")
 
     def ablations(self):
         return {name: getattr(self, name) for name in
@@ -58,14 +68,14 @@ class Settings:
 
 
 #: Where the SRLVR actor advantage takes its baseline/scale from.
-#:   history -- the calibration history window (default; the method as published)
-#:   batch   -- the CURRENT batch of trajectories (REINFORCE++-style)
+#:   history -- the calibration history window (the method as published)
+#:   batch   -- the CURRENT batch of trajectories (REINFORCE++-style; default)
 ADVANTAGE_MODES = ("history", "batch")
 
 
 def advantage_mode() -> str:
     """Read ``SRLVR_ADVANTAGE_MODE`` and fail closed on anything unknown."""
-    mode = os.environ.get("SRLVR_ADVANTAGE_MODE", "history").lower()
+    mode = os.environ.get("SRLVR_ADVANTAGE_MODE", "batch").lower()
     if mode not in ADVANTAGE_MODES:
         raise ValueError(
             f"SRLVR_ADVANTAGE_MODE must be one of {ADVANTAGE_MODES}, got {mode!r}"

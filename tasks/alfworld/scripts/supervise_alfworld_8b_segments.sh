@@ -14,7 +14,7 @@ RUN_DIR="${RUN_DIR:-$PROJ/runs/$RUN}"
 LOG="${LOG:-$PROJ/logs/$RUN.log}"
 STATE_LOG="${STATE_LOG:-$PROJ/logs/$RUN.segment_supervisor.log}"
 LOCK="/tmp/opsd_${RUN}.segments.lock"
-TOTAL="${TOTAL_ROLLOUTS:-200}"
+TOTAL="${TOTAL_ROLLOUTS:-100}"
 SEGMENT="${SEGMENT_ROLLOUTS:-50}"
 SAVE_INTERVAL="$SEGMENT"
 PP="${PP:-1}"
@@ -57,6 +57,7 @@ while :; do
   setsid env RUN_NAME="$RUN" SAVE_DIR="$RUN_DIR" LOG="$LOG" \
     NUM_ROLLOUT="$segment_end" SAVE_INTERVAL="$SAVE_INTERVAL" \
     ROLLOUT_GPUS="$ROLLOUT_GPUS" ACTOR_GPUS="$ACTOR_GPUS" PP="$PP" SAVE_TRAIN_STATE=1 \
+    ASYNC_TRAIN="${ASYNC_TRAIN:-0}" ROLLOUT_GPUS_PER_ENGINE="${ROLLOUT_GPUS_PER_ENGINE:-1}" \
     "${resume_args[@]}" \
     bash "$WRAPPER" >> "$STATE_LOG" 2>&1 < /dev/null &
   child=$!

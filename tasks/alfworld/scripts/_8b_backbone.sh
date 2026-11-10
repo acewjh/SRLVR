@@ -40,3 +40,7 @@ export NUM_QUERY_GROUPS=8
 # --untie flag, so the last pipeline/rank would otherwise build a tied lm_head and
 # silently mismatch the checkpoint.
 export UNTIE_EMBEDDINGS=1
+# Match the ALFWorld 4B default: TP2 training and TP2 inference. On the default
+# eight-card rollout allocation this creates four inference engines.
+export TP="${TP:-2}"
+export ROLLOUT_GPUS_PER_ENGINE="${ROLLOUT_GPUS_PER_ENGINE:-2}"

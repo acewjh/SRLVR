@@ -50,7 +50,7 @@ def test_wrapper_keeps_algorithm_specific_values():
     assert 'ROLLOUT_BS="${ROLLOUT_BS:-32}"' in text
     assert 'SRLVR_CALIBRATION="${SRLVR_CALIBRATION:-4}"' in text
     assert 'SRLVR_GAMMA="${SRLVR_GAMMA:-0.99}"' in text
-    assert 'SRLVR_ADVANTAGE_MODE="${SRLVR_ADVANTAGE_MODE:-history}"' in text
+    assert 'SRLVR_ADVANTAGE_MODE="${SRLVR_ADVANTAGE_MODE:-batch}"' in text
     assert "export OPSD_LORA=0" in text
 
 

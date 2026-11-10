@@ -289,8 +289,17 @@ def validate_runtime(args, cfg=None):
     return cfg
 
 
-def attach_rows(rows, episode, group_id, rollout_id):
+def attach_rows(rows, episode, group_id, rollout_id, start_rollout_id=0):
     cfg = Settings.from_env()
+    # The batch is filed under `rollout_id`, but the weights that actually
+    # generated it are `rollout_id - stale_lag` when rollout is overlapped with
+    # the actor update. The first rollout of an async run is generated before
+    # any update, so it is on-policy even when the lag is armed.
+    start = 0 if start_rollout_id is None else int(start_rollout_id)
+    lag = cfg.stale_lag if rollout_id > start else 0
+    policy_version = rollout_id - lag
+    if policy_version < 0:
+        raise RuntimeError("SRLVR stale lag exceeds the rollout counter")
     actor_end = 0
     for row, turn in zip(rows, episode.turns, strict=True):
         if row.response_length == 0:
@@ -300,7 +309,7 @@ def attach_rows(rows, episode, group_id, rollout_id):
             raise RuntimeError("SRLVR row is missing its Full HSI teacher view")
         actor_end += sum(row.loss_mask)
         row.metadata["srlvr"] = dict(position=group_id, turn=turn.turn_idx,
-            trajectory_id=f"{rollout_id}:{turn.episode_id}", policy_version=rollout_id,
+            trajectory_id=f"{rollout_id}:{turn.episode_id}", policy_version=policy_version,
             calibration=group_id < cfg.calibration, terminal_reward=episode.reward,
             turn_end=actor_end, teacher_view=view, B=0., mu=[], f_chosen=[], e=[])
 
@@ -744,6 +753,42 @@ def assign_probe_positions(calibration, dp_rank, dp_size):
     return list(range(dp_rank, calibration, dp_size))
 
 
+PROBE_GRAD_COPY_ENV = "SRLVR_PROBE_GRAD_COPY"
+PROBE_ASSIGN_ENV = "SRLVR_PROBE_ASSIGN"
+
+
+def probe_grad_copy_mode():
+    value = os.environ.get(PROBE_GRAD_COPY_ENV, "per_trajectory").strip().lower()
+    if value not in ("per_chunk", "per_trajectory"):
+        raise ValueError("SRLVR_PROBE_GRAD_COPY must be per_chunk or per_trajectory")
+    return value
+
+
+def _probe_position_work(trajectory):
+    """Expected probe work for one position: Z plus Y sequence tokens."""
+    z = sum(len(r["tokens"]) for r in trajectory if any(r["mask"]))
+    y = sum(len(r["tokens"]) for r in trajectory
+            if any(r["mask"]) and r["meta"]["B"] != 0.)
+    return z + y
+
+
+def assign_balanced_probe_positions(trajectories, calibration, dp_rank, dp_size):
+    """Pick the 2+2 pairing whose heavier DP group is cheapest.
+
+    Only the execution assignment changes: every position is still probed
+    exactly once, with the same Z/Y row sets and the same C/D aggregation.
+    """
+    if dp_size != 2 or calibration != 4:
+        return assign_probe_positions(calibration, dp_rank, dp_size)
+    work = [_probe_position_work(trajectories[i]) for i in range(calibration)]
+    pairings = (((0, 1), (2, 3)), ((0, 2), (1, 3)), ((0, 3), (1, 2)))
+    def cost(pairing):
+        left = sum(work[i] for i in pairing[0])
+        right = sum(work[i] for i in pairing[1])
+        return (max(left, right), pairing)
+    return list(min(pairings, key=cost)[dp_rank])
+
+
 def _gather_probe_records(records, dp_group, dp_size, profile=None):
     """Gather the small per-position scalar records once per rollout."""
     import torch.distributed as dist
@@ -854,9 +899,18 @@ def _probe_trajectory_vectors(actor, rollout_id, position, trajectory, reward, w
         if len(micro) != 1 or micro[0] * args.micro_batch_size != len(rows):
             raise RuntimeError("raw score probe must accumulate the complete chunk")
         captured = []
+        # Device-side accumulation is only valid for isolated-DP probes: the
+        # serial path runs DP finalization per chunk, which would re-reduce an
+        # already-accumulated buffer. Keep serial byte-for-byte unchanged.
+        per_trajectory = isolated_dp and probe_grad_copy_mode() == "per_trajectory"
 
         def capture(model):
             nonlocal total
+            if per_trajectory:
+                # Gradients stay in main_grad; the trajectory is copied once
+                # after the last chunk (see below).
+                captured.append(True)
+                return
             if isolated_dp:
                 if config.finalize_model_grads_func is not None:
                     raise RuntimeError(
@@ -878,6 +932,8 @@ def _probe_trajectory_vectors(actor, rollout_id, position, trajectory, reward, w
         args.srlvr_loss_scale = len(rows)
         args.srlvr_calibration = True
         args.srlvr_probe_isolated_dp = isolated_dp
+        args.srlvr_probe_skip_grad_zero = per_trajectory and chunks > 0
+        args.srlvr_probe_keep_grad = per_trajectory
         args.srlvr_gradient_probe = capture
         callbacks = {key: getattr(config, key, None) for key in (
             "no_sync_func", "grad_sync_func", "param_sync_func",
@@ -895,6 +951,8 @@ def _probe_trajectory_vectors(actor, rollout_id, position, trajectory, reward, w
             args.srlvr_gradient_probe = None
             args.srlvr_calibration = False
             args.srlvr_probe_isolated_dp = False
+            args.srlvr_probe_skip_grad_zero = False
+            args.srlvr_probe_keep_grad = False
             for key, value in callbacks.items():
                 setattr(config, key, value)
         if getattr(args, "srlvr_actual_optimizer_steps", 0) != before:
@@ -908,6 +966,17 @@ def _probe_trajectory_vectors(actor, rollout_id, position, trajectory, reward, w
             srlvr_compact.empty_cache()
             if profile is not None:
                 profile["empty_cache_s"] = profile.get("empty_cache_s", 0.) + time.perf_counter() - empty_started
+    if per_trajectory:
+        if isolated_dp:
+            sync_started = time.perf_counter()
+            _finalize_probe_tp_gradients(actor.model)
+            if profile is not None:
+                profile["tp_sync_s"] = profile.get("tp_sync_s", 0.) + time.perf_counter() - sync_started
+        total = _accumulate_probe_gradient(
+            actor.model, entries, None, reconstruct_dp=not isolated_dp, profile=profile)
+        for model_chunk in actor.model:
+            model_chunk.zero_grad_buffer()
+        actor.optimizer.zero_grad()
     if total is None:
         raise RuntimeError("probe had no turns")
     if profile is not None:
@@ -959,8 +1028,15 @@ def _run_calibration_probes(actor, rollout_id, cfg, trajectories, eff_b, eff_s, 
     from methods import srlvr_compact
     dp_size = mpu.get_data_parallel_world_size()
     dp_rank = mpu.get_data_parallel_rank()
-    positions = (assign_probe_positions(cfg.calibration, dp_rank, dp_size)
-                 if isolated_dp else list(range(cfg.calibration)))
+    if not isolated_dp:
+        positions = list(range(cfg.calibration))
+    elif os.environ.get(PROBE_ASSIGN_ENV, "balanced").strip().lower() == "balanced":
+        positions = assign_balanced_probe_positions(
+            trajectories, cfg.calibration, dp_rank, dp_size)
+    elif os.environ.get(PROBE_ASSIGN_ENV).strip().lower() == "roundrobin":
+        positions = assign_probe_positions(cfg.calibration, dp_rank, dp_size)
+    else:
+        raise ValueError("SRLVR_PROBE_ASSIGN must be balanced or roundrobin")
     profile["positions"] = positions
     records = []
     for position in positions:
@@ -1100,6 +1176,29 @@ def _probe_control_compare(runs, cfg, state, eff_b, eff_s, rollout_id):
     return report
 
 
+def resolve_policy_gap(rows, rollout_id, max_stale):
+    """Return ``(behavior_version, gap)`` for one complete batch.
+
+    A batch must come from exactly one generation snapshot; overlapping rollout
+    may put that snapshot one weight version behind the training step. Anything
+    deeper than ``max_stale`` is rejected because the actor loss only truncates
+    the importance ratio at ``eps_clip``, which is not a valid correction once
+    the policies have diverged further.
+    """
+    versions = {int(r["meta"]["policy_version"]) for r in rows}
+    if len(versions) != 1:
+        raise RuntimeError(f"SRLVR mixed rollout snapshots: {sorted(versions)}")
+    behavior_version = versions.pop()
+    gap = int(rollout_id) - behavior_version
+    if gap < 0:
+        raise RuntimeError(
+            f"SRLVR batch for rollout {rollout_id} claims future policy {behavior_version}")
+    if gap > int(max_stale):
+        raise RuntimeError(
+            f"SRLVR stale policy gap {gap} exceeds max_stale={max_stale}")
+    return behavior_version, gap
+
+
 def train_batch(actor, rollout_id, data):
     import torch.distributed as dist
     from megatron.core import mpu
@@ -1165,8 +1264,10 @@ def train_batch(actor, rollout_id, data):
     gathered = [None] * mpu.get_data_parallel_world_size()
     dist.all_gather_object(gathered, local, group=mpu.get_data_parallel_group_gloo())
     rows = sorted([r for part in gathered for r in part], key=lambda r: (r["meta"]["position"], r["meta"]["turn"]))
-    if any(r["meta"]["policy_version"] != rollout_id for r in rows):
-        raise RuntimeError("SRLVR mixed rollout snapshots")
+    behavior_version, policy_gap = resolve_policy_gap(rows, rollout_id, cfg.max_stale)
+    logger.info("[srlvr-stale] rollout=%s behavior_policy=%s gap=%s max_stale=%s mode=%s",
+                rollout_id, behavior_version, policy_gap, cfg.max_stale,
+                "truncated_is" if policy_gap else "on_policy")
     trajectories = fill_future(rows, cfg.gamma, cfg.trajectory_uniform_b)
     if set(trajectories) != set(range(data["srlvr_batch"]["N"])):
         raise RuntimeError("SRLVR DP split lost real trajectories")
@@ -1183,6 +1284,17 @@ def train_batch(actor, rollout_id, data):
     logger.info("[srlvr-hsi-views] variant=%s rollout=%s p=causal q=%s temperature=%s support=%s bias=%s mae=%s",
                 cfg.variant, rollout_id, "outcome_only" if cfg.teacher_outcome_only else "Full", args.rollout_temperature, args.vocab_size,
                 sum(deltas) / max(1, len(deltas)), sum(abs(v) for v in deltas) / max(1, len(deltas)))
+    if policy_gap:
+        # The actor loss turns these log-ratios into the truncated importance
+        # ratio exp(lp - old); log how far off-policy the batch actually is so a
+        # diverging actor/rollout pair is visible before the clip hides it.
+        low = math.log(max(1 - getattr(args, "eps_clip", 0.2), 1e-12))
+        high = math.log(1 + getattr(args, "eps_clip_high", 0.2))
+        clipped = sum(1 for value in deltas if value < low or value > high)
+        logger.info("[srlvr-stale-ratio] rollout=%s gap=%s tokens=%s mean_ratio=%s clipped_frac=%s",
+                    rollout_id, policy_gap, len(deltas),
+                    math.exp(sum(deltas) / max(1, len(deltas))),
+                    clipped / max(1, len(deltas)))
 
     # Effective baseline/scale for EVERY consumer of this batch: the calibration
     # probes, the recovered score norm, and the actor advantage. `history` keeps

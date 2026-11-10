@@ -171,6 +171,9 @@ if [ "$ARM" = "eval" ]; then
     --n-samples-per-eval-prompt "${N_SAMPLES_PER_EVAL_PROMPT:-1}"
     --eval-max-response-len "$MAX_RESPONSE"
   )
+  if [ "${EVAL_USE_CHECKPOINT_OPT_PARAM_SCHEDULER:-0}" = "1" ]; then
+    EVAL_ARGS+=( --use-checkpoint-opt-param-scheduler )
+  fi
 fi
 
 # Everything that depends on G must be derived HERE, after the arm switch -- the
@@ -233,6 +236,13 @@ if [ "$EVAL_ONLY" = "1" ]; then
     --n-samples-per-eval-prompt "${N_SAMPLES_PER_EVAL_PROMPT:-1}"
     --eval-max-response-len "$MAX_RESPONSE"
   )
+  # Eval-only builds train_iters=0, while a full-model checkpoint carries the
+  # training scheduler (total_iters=3200 for 100 rollouts); without this the
+  # OptimizerParamScheduler load asserts 32 != 3200. No optimizer step runs in
+  # eval, so taking the checkpoint's scheduler values is safe.
+  if [ "${EVAL_USE_CHECKPOINT_OPT_PARAM_SCHEDULER:-0}" = "1" ]; then
+    EVAL_ARGS+=( --use-checkpoint-opt-param-scheduler )
+  fi
 else
   ROLLOUT_GPUS="${ROLLOUT_GPUS:-6}"
   ACTOR_GPUS="${ACTOR_GPUS:-2}"
@@ -257,6 +267,9 @@ export ALFWORLD_V2_HSI_GRANULARITY="${ALFWORLD_V2_HSI_GRANULARITY:-token}"
 
 export ALFWORLD_V2_MAX_TURNS="$MAX_TURNS"
 export ALFWORLD_V2_MAX_RESPONSE="$MAX_RESPONSE"
+export ALFWORLD_V2_CONTINUAL="${ALFWORLD_V2_CONTINUAL:-1}"
+export ALFWORLD_V2_CONTINUAL_MAX_INFLIGHT="${ALFWORLD_V2_CONTINUAL_MAX_INFLIGHT:-$ROLLOUT_BS}"
+export ALFWORLD_V2_POOL_CAPACITY="${ALFWORLD_V2_POOL_CAPACITY:-$((2 * ROLLOUT_BS))}"
 export ALFWORLD_V2_HISTORY="$HISTORY_LENGTH"
 export ALFWORLD_V2_FUTURE_GAP="$FUTURE_GAP"
 export ALFWORLD_V2_SCHEDULE="$SCHEDULE"
@@ -415,13 +428,13 @@ if [ "${OOM_SEQUENCE_PARALLEL:-0}" = "1" ] && [ "${OPSD_LORA:-0}" != "1" ]; then
   SEQ_PARALLEL_ARGS=(--sequence-parallel)
 fi
 
-echo "[v2] arm=$ARM hpi=$ALFWORLD_V2_HPI estimator=$ADVANTAGE_ESTIMATOR G=$G bs=$ROLLOUT_BS GBS=$GLOB_BS turns=$MAX_TURNS cap=$MAX_RESPONSE hist=$HISTORY_LENGTH gap=$FUTURE_GAP steps=$NUM_ROLLOUT" | tee -a "$LOG"
+echo "[v2] arm=$ARM hpi=$ALFWORLD_V2_HPI estimator=$ADVANTAGE_ESTIMATOR G=$G bs=$ROLLOUT_BS GBS=$GLOB_BS turns=$MAX_TURNS cap=$MAX_RESPONSE hist=$HISTORY_LENGTH gap=$FUTURE_GAP continual=$ALFWORLD_V2_CONTINUAL inflight=$ALFWORLD_V2_CONTINUAL_MAX_INFLIGHT pool_capacity=$ALFWORLD_V2_POOL_CAPACITY steps=$NUM_ROLLOUT" | tee -a "$LOG"
 echo "[v2-efficiency] actor=$ACTOR_GPUS train_tp=$TP lora=$OPSD_LORA rollout=$ROLLOUT_GPUS inference_tp=${ROLLOUT_GPUS_PER_ENGINE:-1} prefix_cache=${SGLANG_PREFIX_CACHE:-1} thinking=${ALFWORLD_THINKING_STYLE:-legacy} history=complete kl=$KL_COEF candidate_k=${ALFWORLD_V2_HSI_CANDIDATE_K:-auto}" | tee -a "$LOG"
 if [ "${OPSD_SRLVR:-0}" = "1" ] && [ "${SRLVR_VARIANT:-}" = "v2" ]; then
   # v2/v3 hindsight compaction is read by rollout.py from SRLVR_COMPACT_FUTURE
   # (default 0). Print the value that will actually be used: a hardcoded
   # compact=0 here once contradicted a run that really ran compact=1.
-  echo "[srlvr-hsi-config] variant=v2 gamma=${SRLVR_GAMMA:-0.99} future=full compact=${SRLVR_COMPACT_FUTURE:-0} advantage_mode=${SRLVR_ADVANTAGE_MODE:-history} thinking=${ALFWORLD_THINKING_STYLE:-brief} thinking_tokens=${ALFWORLD_THINKING_TOKENS:-unset} max_response=$MAX_RESPONSE context_train=$SEQ_LENGTH context_inference=$SEQ_LENGTH reference_kl=low_var_kl:${KL_COEF:-0.001} ref=$MODEL save_interval=$SAVE_INTERVAL rollouts=$NUM_ROLLOUT" | tee -a "$LOG"
+  echo "[srlvr-hsi-config] variant=v2 gamma=${SRLVR_GAMMA:-0.99} future=full compact=${SRLVR_COMPACT_FUTURE:-0} advantage_mode=${SRLVR_ADVANTAGE_MODE:-batch} thinking=${ALFWORLD_THINKING_STYLE:-brief} thinking_tokens=${ALFWORLD_THINKING_TOKENS:-unset} max_response=$MAX_RESPONSE context_train=$SEQ_LENGTH context_inference=$SEQ_LENGTH continual=$ALFWORLD_V2_CONTINUAL inflight=$ALFWORLD_V2_CONTINUAL_MAX_INFLIGHT reference_kl=low_var_kl:${KL_COEF:-0.001} ref=$MODEL save_interval=$SAVE_INTERVAL rollouts=$NUM_ROLLOUT" | tee -a "$LOG"
 fi
 if [ "${OPSD_SRLVR:-0}" = "1" ] && [ "${SRLVR_VARIANT:-}" = "v4" ]; then
   echo "[srlvr-v4-config] beta=${SRLVR_V4_BETA:-0.0} token_clip=${SRLVR_V4_TOKEN_CLIP:-0.05} teacher=${MODEL} teacher_attn=${SRLVR_V4_TEACHER_ATTN:-sdpa} compact=${SRLVR_V4_COMPACT_FUTURE:-1} thinking=${ALFWORLD_THINKING_STYLE:-brief} thinking_tokens=${ALFWORLD_THINKING_TOKENS:-unset} max_response=$MAX_RESPONSE context_train=$SEQ_LENGTH context_inference=$SEQ_LENGTH reference_kl=low_var_kl:${KL_COEF:-0.001} ref=$MODEL save_interval=$SAVE_INTERVAL rollouts=$NUM_ROLLOUT" | tee -a "$LOG"
@@ -585,6 +598,40 @@ if [ -n "${LOAD_DEBUG_ROLLOUT_DATA:-}" ]; then
   TRAIN_ARGS+=(--load-debug-rollout-data "$LOAD_DEBUG_ROLLOUT_DATA")
 fi
 
+TRAIN_ENTRYPOINT=train.py
+if [ "${ASYNC_TRAIN:-0}" = "1" ]; then
+  if [ "${COLOCATE:-0}" = "1" ]; then
+    echo "[v2] FATAL: ASYNC_TRAIN=1 requires separated actor and rollout GPUs" >> "$LOG"
+    exit 2
+  fi
+  if [ "${OPSD_SRLVR:-0}" = "1" ]; then
+    if [ "${SRLVR_STALE_POLICY_CORRECTION:-1}" != "1" ]; then
+      echo "[v2] FATAL: ASYNC_TRAIN=1 with SRLVR needs SRLVR_STALE_POLICY_CORRECTION=1" >> "$LOG"
+      exit 2
+    fi
+    if [ "${SRLVR_VARIANT:-}" != "v2" ] && [ "${SRLVR_VARIANT:-}" != "v3" ]; then
+      echo "[v2] FATAL: async SRLVR implements stale-policy stamping for v2/v3 only (got ${SRLVR_VARIANT:-unset})" >> "$LOG"
+      exit 2
+    fi
+    # The weight-update interval is pinned to 1 by validate_runtime, so an
+    # overlapped rollout is exactly one weight version behind the actor that
+    # trains it. The rows are stamped with that generation version and the
+    # actor loss applies the clip on exp(logp_now - logp_rollout).
+    if [ -n "${RESUME_FROM:-}" ]; then
+      echo "[v2] FATAL: async SRLVR resume is not supported yet (the rollout manager cannot see start_rollout_id); start a fresh run" >> "$LOG"
+      exit 2
+    fi
+    export SRLVR_STALE_LAG="${SRLVR_STALE_LAG:-1}"
+    export SRLVR_MAX_STALE="${SRLVR_MAX_STALE:-1}"
+    echo "[v2-stale] SRLVR async: stale_lag=$SRLVR_STALE_LAG max_stale=$SRLVR_MAX_STALE correction=truncated_is" >> "$LOG"
+  else
+    export SRLVR_STALE_LAG="${SRLVR_STALE_LAG:-0}"
+  fi
+  TRAIN_ENTRYPOINT=train_async.py
+  TRAIN_ARGS+=(--use-rollout-logprobs)
+fi
+echo "[v2-driver] entrypoint=$TRAIN_ENTRYPOINT async_train=${ASYNC_TRAIN:-0} rollout_logprobs=$([ "${ASYNC_TRAIN:-0}" = "1" ] && echo 1 || echo 0) colocate=${COLOCATE:-0}" | tee -a "$LOG"
+
 # Replay the argv through slime's parser and exit. This is the cheap gate for the
 # one failure mode that has cost this project real time twice: a flag that parses
 # into an EMPTY-STRING arg key (a bare negative value is the usual way in) crashes
@@ -629,7 +676,7 @@ cd "$PROJ"
 # the semantics "GRPO over episodes" now that the rows are turns.
 export OPSD_ENABLED=1
 
-python "$PROJ/frameworks/slime-ascend/train.py" "${TRAIN_ARGS[@]}" >> "$LOG" 2>&1
+python "$PROJ/frameworks/slime-ascend/$TRAIN_ENTRYPOINT" "${TRAIN_ARGS[@]}" >> "$LOG" 2>&1
 train_rc=$?
 echo "[v2] $ARM exited rc=$train_rc $(date '+%F %H:%M:%S')" >> "$LOG"
 exit "$train_rc"

@@ -32,6 +32,9 @@ export NUM_QUERY_GROUPS=8
 # repeat-stop arm needs TP=1 for its teacher/chunking layout) must set TP
 # explicitly AFTER sourcing this file; `${TP:-2}` keeps that override intact.
 export TP="${TP:-2}"
+# One TP2 SGLang engine per two rollout cards is the ALFWorld 4B default.
+# Explicit per-run overrides still take precedence.
+export ROLLOUT_GPUS_PER_ENGINE="${ROLLOUT_GPUS_PER_ENGINE:-2}"
 
 # 8+8 colocate is the target 4B layout. The earlier graph-enabled smoke failed
 # during initial weight sync with torch_npu's captures_underway assertion; the

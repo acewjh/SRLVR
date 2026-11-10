@@ -18,31 +18,49 @@ import pytest
 PROJ = pathlib.Path(__file__).resolve().parents[3]
 SCRIPTS = PROJ / "tasks/alfworld" / "scripts"
 BACKBONE = SCRIPTS / "_4b_backbone.sh"
+BACKBONE_8B = SCRIPTS / "_8b_backbone.sh"
 REPEAT_STOP = SCRIPTS / "run_alfworld_v2_repeat_stop_4b.sh"
 EVAL_4B = SCRIPTS / "run_alfworld_v2_eval_4b.sh"
 
 
-def _resolved_tp(override: str | None = None) -> str:
-    prelude = f"export TP={shlex.quote(override)};" if override is not None else "unset TP;"
+def _resolved(backbone: pathlib.Path = BACKBONE, tp: str | None = None,
+              rollout_tp: str | None = None) -> tuple[str, str]:
+    prelude = (
+        f"export TP={shlex.quote(tp)};" if tp is not None else "unset TP;"
+    )
+    if rollout_tp is not None:
+        prelude += f" export ROLLOUT_GPUS_PER_ENGINE={shlex.quote(rollout_tp)};"
+    else:
+        prelude += " unset ROLLOUT_GPUS_PER_ENGINE;"
     script = f"""
 set -uo pipefail
 {prelude}
-source {shlex.quote(str(BACKBONE))}
-printf '%s' "$TP"
+source {shlex.quote(str(backbone))}
+printf '%s %s' "$TP" "$ROLLOUT_GPUS_PER_ENGINE"
 """
     proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
     assert proc.returncode == 0, proc.stderr
-    return proc.stdout.strip()
+    return tuple(proc.stdout.strip().split())
 
 
 @pytest.mark.unit
 def test_backbone_defaults_to_tp2():
-    assert _resolved_tp() == "2"
+    assert _resolved() == ("2", "2")
 
 
 @pytest.mark.unit
 def test_explicit_tp_still_wins():
-    assert _resolved_tp("4") == "4"
+    assert _resolved(tp="4", rollout_tp="3") == ("4", "3")
+
+
+@pytest.mark.unit
+def test_8b_backbone_defaults_match_4b():
+    assert _resolved(BACKBONE_8B) == ("2", "2")
+
+
+@pytest.mark.unit
+def test_8b_explicit_tp_settings_still_win_independently():
+    assert _resolved(BACKBONE_8B, tp="4", rollout_tp="1") == ("4", "1")
 
 
 @pytest.mark.unit

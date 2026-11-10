@@ -140,3 +140,20 @@ def get_int(name: str, default: int) -> int:
     if raw is None or raw == "":
         return default
     return int(raw)
+
+
+def continual_enabled() -> bool:
+    """Use the policy-versioned async episode pool for training rollouts."""
+    return os.environ.get("ALFWORLD_V2_CONTINUAL", "0").strip().lower() in (
+        "1", "true", "yes", "on"
+    )
+
+
+def continual_max_inflight(default: int) -> int:
+    """Maximum number of ALFWorld groups in flight for the local pool."""
+    return get_int("ALFWORLD_V2_CONTINUAL_MAX_INFLIGHT", default)
+
+
+def pool_capacity(default: int) -> int:
+    """Configured retained capacity; draining still requires one full batch."""
+    return get_int("ALFWORLD_V2_POOL_CAPACITY", default)

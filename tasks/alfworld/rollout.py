@@ -46,6 +46,7 @@ from .advantages import (
 )
 from .episode import run_episode
 from .privilege import has_future, render_hpi_block, render_trajectory_block
+from .pool import collect_ordered
 
 __all__ = ["generate_rollout", "build_group_samples"]
 
@@ -116,33 +117,42 @@ def _turn_rows(groups) -> int:
     return sum(len(episode.turns) for episodes, _adv in groups for episode in episodes)
 
 
-async def _top_up_round(args, state, games, seeds, engines, groups, group_games, group_ids, topup_round) -> None:
+async def _top_up_round(
+    args, state, games, seeds, engines, groups, group_games, group_ids, topup_round, policy_version
+) -> None:
     """Append ONE round of extra same-task episodes (mutates the group lists).
 
     Fresh seeds and fresh group ids, but the same ``games`` -- so no task changes
     and nothing is selected on reward. Shared by both floor checks below.
     """
     base = len(games) * topup_round
-    extra = await asyncio.gather(
-        *[
-            _run_group(
-                args,
-                state,
-                games[i],
-                seeds[i] + topup_round * _TOPUP_SEED_STRIDE,
-                base + i,
-                engines,
-            )
-            for i in range(len(games))
-        ]
-    )
+    factories = [
+        lambda i=i: _run_group(
+            args,
+            state,
+            games[i],
+            seeds[i] + topup_round * _TOPUP_SEED_STRIDE,
+            base + i,
+            engines,
+        )
+        for i in range(len(games))
+    ]
+    if config.continual_enabled():
+        extra = await collect_ordered(
+            factories,
+            policy_version=policy_version,
+            max_inflight=config.continual_max_inflight(len(factories)),
+            pool_capacity=config.pool_capacity(len(factories) * 2),
+        )
+    else:
+        extra = await asyncio.gather(*[factory() for factory in factories])
     groups.extend(extra)
     group_games.extend(games)
     group_ids.extend(range(base, base + len(games)))
 
 
 async def _top_up_to_floor(
-    args, state, games, seeds, engines, groups, group_games, group_ids, min_rows
+    args, state, games, seeds, engines, groups, group_games, group_ids, min_rows, policy_version
 ) -> int:
     """Append same-task episodes to ``groups`` until it clears ``min_rows`` turn-rows.
 
@@ -167,7 +177,7 @@ async def _top_up_to_floor(
     while min_rows > 0 and _turn_rows(groups) < min_rows and topup_round < _MAX_TOPUP_ROUNDS:
         topup_round += 1
         await _top_up_round(
-            args, state, games, seeds, engines, groups, group_games, group_ids, topup_round
+            args, state, games, seeds, engines, groups, group_games, group_ids, topup_round, policy_version
         )
     return topup_round
 
@@ -866,11 +876,28 @@ async def _generate_rollout_async(args: Namespace, rollout_id: int):
     engines = _engine_urls(args)
     group_games: list = list(games)
     group_ids: list[int] = list(range(len(games)))
-    groups: list = list(
-        await asyncio.gather(
-            *[_run_group(args, state, game, seeds[i], i, engines) for i, game in enumerate(games)]
+    factories = [
+        lambda i=i, game=game: _run_group(args, state, game, seeds[i], i, engines)
+        for i, game in enumerate(games)
+    ]
+    if config.continual_enabled():
+        groups = await collect_ordered(
+            factories,
+            policy_version=rollout_id,
+            max_inflight=config.continual_max_inflight(len(factories)),
+            pool_capacity=config.pool_capacity(len(factories) * 2),
         )
-    )
+        logger.info(
+            "[continual-pool] rollout=%d policy_version=%d expected=%d capacity=%d max_inflight=%d complete=%s",
+            rollout_id,
+            rollout_id,
+            len(factories),
+            config.pool_capacity(len(factories) * 2),
+            config.continual_max_inflight(len(factories)),
+            True,
+        )
+    else:
+        groups = list(await asyncio.gather(*[factory() for factory in factories]))
 
     # -- turn-row floor -------------------------------------------------------
     # A rollout must hand the trainer at least one optimizer step's worth of
@@ -891,7 +918,7 @@ async def _generate_rollout_async(args: Namespace, rollout_id: int):
     # floor, leave it unset and the trainer's value is used.
     min_rows = 0  # One real attempt per sample; pad rows rather than resampling.
     topup_round = await _top_up_to_floor(
-        args, state, games, seeds, engines, groups, group_games, group_ids, min_rows
+        args, state, games, seeds, engines, groups, group_games, group_ids, min_rows, rollout_id
     )
 
     def _emit():
@@ -929,9 +956,13 @@ async def _generate_rollout_async(args: Namespace, rollout_id: int):
                 else:
                     if variant in ("v2", "v3"):
                         from methods.srlvr_hsi import attach_rows
+                        # Async rollout files a batch under `rollout_id` but
+                        # generation may have used the previous weights.
+                        attach_rows(rows, episodes[0], group_id, rollout_id,
+                                    getattr(args, "start_rollout_id", 0))
                     else:
                         from methods.srlvr import attach_rows
-                    attach_rows(rows, episodes[0], group_id, rollout_id)
+                        attach_rows(rows, episodes[0], group_id, rollout_id)
             if not rows:
                 continue
             built.append(rows)
@@ -982,7 +1013,7 @@ async def _generate_rollout_async(args: Namespace, rollout_id: int):
             topup_round - 1,
         )
         await _top_up_round(
-            args, state, games, seeds, engines, groups, group_games, group_ids, topup_round
+            args, state, games, seeds, engines, groups, group_games, group_ids, topup_round, rollout_id
         )
         data, stats, primary_episodes, primary_successes = _emit()
 

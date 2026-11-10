@@ -182,6 +182,9 @@ class HeadRef:
 def hidden_forward(model, forward_kwargs):
     """Run the decoder without its output layer; return hidden states and head."""
     gpt = _unwrap_gpt(model)
+    # Bridge VL models compose a GPT decoder with a trainable visual tower.
+    # Keep the outer visual forward intact; defer only the decoder's lm_head.
+    gpt = getattr(gpt, "language_model", gpt)
     if not hasattr(gpt, "post_process"):
         raise RuntimeError("selective SRLVR needs a GPTModel chunk with post_process")
     previous = gpt.post_process
@@ -391,7 +394,14 @@ def log_probs_from_hidden(args, batch, hidden, head=None, with_entropy: bool = F
             )
         )
     values = torch.cat(parts) if parts else torch.zeros(0, device=hidden.device)
-    return {"log_probs": [_scatter(values, response_index, response)]}
+    output = _scatter(values, response_index, response)
+    if not parts:
+        # Padding/invalid-only rows still participate in a distributed backward.
+        # Preserve zero gradients through both decoder and output parameters.
+        output = output + hidden.sum() * 0 + head.weight.sum() * 0
+        if head.bias is not None:
+            output = output + head.bias.sum() * 0
+    return {"log_probs": [output]}
 
 
 def collect_log_probs(hidden, *, args, unconcat_tokens, total_lengths, response_lengths,
